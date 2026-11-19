@@ -1,0 +1,16 @@
+{
+  "name": "@check/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "React + Vite PWA (placeholder until WEB-01).",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@check/engine": "workspace:*",
+    "@check/protocol": "workspace:*"
+  }
+}

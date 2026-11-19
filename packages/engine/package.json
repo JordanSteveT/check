@@ -1,0 +1,16 @@
+{
+  "name": "@check/engine",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Pure rules engine for the Check card game (no runtime dependencies).",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}

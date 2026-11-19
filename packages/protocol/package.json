@@ -1,0 +1,15 @@
+{
+  "name": "@check/protocol",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Message types and Zod schemas of the Check real-time protocol.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}
