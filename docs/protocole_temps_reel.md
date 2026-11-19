@@ -59,7 +59,8 @@ Les 54 identifiants sont uniques : ils servent directement d'identifiants de car
 * Encodage **JSON**, texte UTF-8, **4 Ko maximum** par message.
 * Champ `t` : type du message.
 * **Client → serveur** : chaque action porte un identifiant `id` (UUID v4 généré par le client). Le serveur répond par `ACK` ou `ERROR` avec le même `id`. Un `id` déjà traité est ignoré (renvoi après reconnexion sans risque).
-* **Serveur → client** : chaque événement de salon porte `seq`, numéro croissant propre au salon, commençant à 1. Un client qui constate un trou dans `seq` envoie `SYNC`.
+* **Serveur → client** : chaque événement de salon **diffusé à tous** porte `seq`, numéro croissant propre au salon, commençant à 1. Les messages privés (`AUTH_OK`, `ACK`, `ERROR`, `STATE`, `PONG`, `HAND`, `YOU_DREW`) n'ont pas de `seq`, pour ne pas créer de trou chez les autres joueurs. Un client qui constate un trou dans `seq` envoie `SYNC`.
+* **Message invalide** (JSON illisible, type inconnu, champ manquant ou en trop) : `ERROR` avec le code `INVALID_MESSAGE`, et l'`id` du message s'il est lisible. Si seules les options sont invalides : `INVALID_OPTIONS` ; si seul le montant l'est : `INVALID_FEE`. Les règles métier du montant (200 à 10 000, paliers de 100) sont vérifiées par le serveur, pas par le schéma.
 * Horodatages : millisecondes depuis l'époque Unix (UTC), horloge du serveur.
 
 ```json
@@ -294,6 +295,7 @@ Le gestionnaire d'alarme est **idempotent** : il relit l'heure et l'état, et ne
 | `ROOM_FULL` / `ROOM_LOCKED` / `ROOM_NOT_FOUND` / `ROOM_STARTING` | « Salon complet. » / « Partie déjà commencée. » / « Salon introuvable. » / « La partie démarre… » |
 | `NOT_HOST` / `NOT_ENOUGH_PLAYERS` | « Seul l'hôte peut faire ça. » / « Il faut au moins 2 joueurs. » |
 | `INVALID_OPTIONS` | « Options de partie invalides. » |
+| `INVALID_MESSAGE` | « Une erreur est survenue. Rechargez l'application. » (message mal formé ; signe d'une app obsolète) |
 | `RATE_LIMITED` | « Trop d'actions, patientez un instant. » |
 
 Les codes liés aux comptes et aux jetons sont ceux de la spécification des jetons (§11.3).
@@ -322,6 +324,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.3 — 19/11/2026.** SRV-01 : `seq` réservé aux événements diffusés ; code `INVALID_MESSAGE` (§3, §11).
+>
 > **Version 1.2 — 19/11/2026.** `createGame` reçoit `now` et `gameId` (ENG-02). `applyPlay` reçoit `{ cards, suit?, declareCheck? }` ; ajout de `canPlayCard` (ENG-03). Dans `CARDS_PLAYED`, `nextPlayerId` et `turnDeadline` valent `null` quand le coup termine la partie. `applyDraw` reçoit `rng` (ENG-06) ; les événements privés du moteur (`YOU_DREW`) portent `playerId`, le destinataire, que le RoomDO retire avant l'envoi. `applyPlay` et `applyCheckCall` reçoivent `rng` (ENG-07). Toute pose ou pioche ferme la fenêtre de dénonciation ouverte et émet `CHECK_WINDOW` avec `targetId: null` avant ses propres événements. `applyTimeout` reçoit `rng`, `applyForfeit` reçoit `now`, `PLAYER_FORFEIT` porte `nextPlayerId` et `turnDeadline` (ENG-09). Ajout de `checkPlay` ; `getPlayerView` ne renvoie que la partie moteur de la vue (ENG-10).
 
 **Joueur déconnecté dont le tour arrive :** le moteur fixe `turnDeadline = now` (tour déjà échu). Le RoomDO programme alors son alarme immédiatement et appelle `applyTimeout` : c'est l'action automatique « immédiate » des règles §9.
