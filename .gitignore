@@ -11,3 +11,6 @@ test-results/
 supabase/.temp/
 .DS_Store
 *.log
+
+# Images personnelles déposées à la racine
+/WhatsApp Image *.jpeg
