@@ -104,7 +104,7 @@ Ce document fixe **comment** le jeu est construit. Les règles du jeu sont dans 
 
 1. L'app se connecte avec Supabase Auth (Google, email ou invité), Turnstile à l'appui.
 2. Elle appelle la fonction SQL `sync_account(pseudo, device_id)` : création du profil, du portefeuille, attribution des bonus selon les règles (spécification des jetons §9).
-3. Elle ouvre le WebSocket `/ws/user` (UserDO) : présence et salon en cours.
+3. Elle ouvre le WebSocket `/ws/user/{userId}` (UserDO) : présence et salon en cours.
 4. Elle s'abonne en Realtime à **sa** ligne de la table `wallets` pour afficher le solde en direct.
 
 ### 4.2 Créer et rejoindre un salon
@@ -168,7 +168,7 @@ Variables d'environnement du Worker : `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`
 
 | Service | Offre | Coût indicatif |
 | ----- | ----- | ----- |
-| Cloudflare Workers + Durable Objects | **Workers Paid** (l'offre gratuite coupe le service quand le quota quotidien est atteint, en pleine partie) | 5 $ / mois + consommation |
+| Cloudflare Workers + Durable Objects | **Workers Paid** en production (l'offre gratuite coupe le service quand le quota quotidien est atteint, en pleine partie). Le développement local (`wrangler dev`) ne demande aucun compte, et l'offre gratuite suffit pour la préproduction : les Durable Objects sont déclarés avec le stockage SQLite (`new_sqlite_classes`), disponible sur les deux offres | 5 $ / mois + consommation |
 | Supabase | **Pro** pour la production (l'offre gratuite met le projet en pause après 7 jours d'inactivité) ; offre gratuite possible pour la préproduction | 25 $ / mois + consommation |
 | SMTP | Offre d'entrée d'un fournisseur d'emails transactionnels | 0 à 20 $ / mois |
 | Nom de domaine | — | ~10 à 15 $ / an |

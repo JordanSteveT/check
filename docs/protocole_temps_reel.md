@@ -26,9 +26,13 @@ Les 54 identifiants sont uniques : ils servent directement d'identifiants de car
 
 | Connexion | URL | Durée de vie |
 | ----- | ----- | ----- |
-| Joueur (présence) | `wss://{domaine}/ws/user` | Toute la session dans l'app |
+| Joueur (présence) | `wss://{domaine}/ws/user/{userId}` | Toute la session dans l'app |
 | Salon | `wss://{domaine}/ws/room/{roomId}` | De l'entrée dans le salon à la fin de la partie |
 | Liste des salons publics | `wss://{domaine}/ws/lobby` | Seulement sur l'écran « Salons publics » |
+
+* `roomId` est l'identifiant du RoomDO créé par `newUniqueId()` (64 caractères hexadécimaux, impossible à deviner). Un identifiant mal formé ou non émis par le serveur reçoit une réponse HTTP **404** avant toute ouverture du WebSocket.
+* `userId` est l'identifiant Supabase du joueur (UUID). Il figure dans l'URL parce que le Worker doit choisir le UserDO **avant** de recevoir `AUTH` ; le UserDO ferme la connexion (4001) si le `sub` du jeton ne correspond pas à `userId`.
+* Une URL `/ws/…` sans en-tête `Upgrade: websocket` reçoit **426**.
 
 ### 2.1 Authentification (toutes les connexions)
 
@@ -201,7 +205,7 @@ Les événements marqués « privé » ne sont envoyés qu'au joueur concerné.
 | `PLAYER_FORFEIT` | `playerId`, `reason` (`LEFT`, `TIMEOUTS`, `DISCONNECTED`), `nextPlayerId`, `turnDeadline` (`null` si la partie est finie) | Tous |
 | `GAME_OVER` | `result` (`WIN`, `DRAW`, `ABORTED`), `winnerId`, `reason` (`EMPTY_HAND`, `LAST_PLAYER`, `BLOCKED`, `TECHNICAL`), `pot`, `commission`, `payout`, `hands` (mains restantes révélées) | Tous |
 
-### 6.3 Connexion joueur (`/ws/user`)
+### 6.3 Connexion joueur (`/ws/user/{userId}`)
 
 | Sens | Message | Rôle |
 | ----- | ----- | ----- |
@@ -324,6 +328,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.4 — 19/11/2026.** SRV-02 : `/ws/user/{userId}` ; format de `roomId` ; réponses 404 et 426 (§2).
+>
 > **Version 1.3 — 19/11/2026.** SRV-01 : `seq` réservé aux événements diffusés ; code `INVALID_MESSAGE` (§3, §11).
 >
 > **Version 1.2 — 19/11/2026.** `createGame` reçoit `now` et `gameId` (ENG-02). `applyPlay` reçoit `{ cards, suit?, declareCheck? }` ; ajout de `canPlayCard` (ENG-03). Dans `CARDS_PLAYED`, `nextPlayerId` et `turnDeadline` valent `null` quand le coup termine la partie. `applyDraw` reçoit `rng` (ENG-06) ; les événements privés du moteur (`YOU_DREW`) portent `playerId`, le destinataire, que le RoomDO retire avant l'envoi. `applyPlay` et `applyCheckCall` reçoivent `rng` (ENG-07). Toute pose ou pioche ferme la fenêtre de dénonciation ouverte et émet `CHECK_WINDOW` avec `targetId: null` avant ses propres événements. `applyTimeout` reçoit `rng`, `applyForfeit` reçoit `now`, `PLAYER_FORFEIT` porte `nextPlayerId` et `turnDeadline` (ENG-09). Ajout de `checkPlay` ; `getPlayerView` ne renvoie que la partie moteur de la vue (ENG-10).
