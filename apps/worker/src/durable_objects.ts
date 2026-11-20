@@ -53,6 +53,8 @@ const OPEN = 1; // WebSocket.READY_STATE_OPEN
 export abstract class ProtocolObject<K extends ConnectionKind> extends DurableObject<Env> {
   protected abstract readonly kind: K;
   protected readonly config: ServerConfig;
+  /** Server clock (ms). Public so that tests can simulate time; tokens use the real time. */
+  clock: () => number = () => Date.now();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -69,8 +71,8 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     const expectedUserId = request.headers.get(USER_ID_HEADER) ?? undefined;
     const attachment: Attachment =
       expectedUserId === undefined
-        ? { phase: "pending", connectedAt: Date.now() }
-        : { phase: "pending", connectedAt: Date.now(), expectedUserId };
+        ? { phase: "pending", connectedAt: this.clock() }
+        : { phase: "pending", connectedAt: this.clock(), expectedUserId };
     pair[1].serializeAttachment(attachment);
     await this.reschedule();
     return new Response(null, { status: 101, webSocket: pair[0] });
@@ -78,7 +80,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
 
   /** Single alarm: AUTH deadlines, then the subclass deadlines; re-armed for the next one. */
   override async alarm(): Promise<void> {
-    const now = Date.now();
+    const now = this.clock();
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.phase === "pending" && att.connectedAt + this.config.authTimeoutMs <= now) {
@@ -123,7 +125,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     if (message.t === "AUTH") {
       await this.authenticate(ws, att, message);
     } else if (message.t === "PING") {
-      this.send(ws, { t: "PONG", c: message.c, s: Date.now() });
+      this.send(ws, { t: "PONG", c: message.c, s: this.clock() });
     } else {
       await this.onMessage(ws, att.userId, message as ActionMessage<K>);
     }
@@ -218,7 +220,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
       connectedAt: att.connectedAt,
     };
     ws.serializeAttachment(authed);
-    this.send(ws, { t: "AUTH_OK", userId: result.userId, serverTime: Date.now() });
+    this.send(ws, { t: "AUTH_OK", userId: result.userId, serverTime: this.clock() });
     if (att.phase === "pending") await this.reschedule();
   }
 }

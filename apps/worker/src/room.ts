@@ -28,6 +28,7 @@ import {
   type RoomStatus,
   type RoomType,
 } from "@check/protocol";
+import { dueDeadlines, roomDeadlines, type Deadline, type DeadlineTimers } from "./deadlines.js";
 import { ProtocolObject, type ActionMessage } from "./durable_objects.js";
 import { GAME_CONFIG, toEngineConfig } from "./game_config.js";
 import { LOCAL_ROOM_SERVICES, type RoomServices } from "./room_services.js";
@@ -66,6 +67,8 @@ export type RoomState = {
   debited: string[];
   /** Rules engine state while PLAYING and after the end (for the last STATE). */
   game: GameState | null;
+  /** Start of the game (PLAYING); aborted after 2 h (protocole §9). */
+  startedAt: number | null;
   /** End of the game; the room closes 60 s later (protocole §9). */
   finishedAt: number | null;
 };
@@ -95,8 +98,15 @@ type RoomEvent =
 type GameMessage = Extract<ActionMessage<"room">, { t: "PLAY" | "DRAW" | "CALL_CHECK" }>;
 
 const STORAGE_KEY = "room";
-/** Delay between the end of the game and the closing of the room (protocole §9). */
-const CLOSE_AFTER_FINISH_MS = 60_000;
+/** Room timers (protocole §9), from the game constants. */
+const TIMERS: DeadlineTimers = {
+  roomTtlMs: GAME_CONFIG.timers.room_ttl_seconds * 1000,
+  gameMaxMs: GAME_CONFIG.timers.game_max_duration_seconds * 1000,
+  closeAfterFinishMs: GAME_CONFIG.timers.finished_room_close_seconds * 1000,
+  minPlayers: GAME_CONFIG.players.min,
+};
+/** Safety bound on the deadlines handled by one alarm (chains of automatic actions). */
+const MAX_DEADLINES_PER_ALARM = 50;
 
 /** Cryptographically secure generator for dealing and reshuffling (cahier B6). */
 const cryptoRng: Rng = () => (crypto.getRandomValues(new Uint32Array(1))[0] ?? 0) / 4294967296;
@@ -129,7 +139,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       hostId: params.hostId,
       fee: params.fee,
       options,
-      createdAt: Date.now(),
+      createdAt: this.clock(),
       status: "WAITING",
       players: [],
       countdownEndsAt: null,
@@ -138,6 +148,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       pot: 0,
       debited: [],
       game: null,
+      startedAt: null,
       finishedAt: null,
     };
     await this.save();
@@ -181,44 +192,61 @@ export class RoomDO extends ProtocolObject<"room"> {
   }
 
   protected override deadlines(): number[] {
-    const room = this.state;
-    if (room === null) return [];
-    if (room.status === "WAITING")
-      return [room.createdAt + GAME_CONFIG.timers.room_ttl_seconds * 1000];
-    if (room.status === "COUNTDOWN" && room.countdownEndsAt !== null) return [room.countdownEndsAt];
-    if (room.status === "PLAYING" && room.game !== null) return [room.game.turnDeadline];
-    if (room.status === "FINISHED" && room.finishedAt !== null) {
-      return [room.finishedAt + CLOSE_AFTER_FINISH_MS];
-    }
-    return [];
+    return this.state === null
+      ? []
+      : roomDeadlines(this.deadlineInput(this.state), TIMERS).map((d) => d.at);
   }
 
+  /**
+   * Handles every due deadline, nearest first. Each handler re-checks the state, so a late or
+   * repeated alarm is harmless; a chain (e.g. several disconnected players in a row) is handled
+   * in one alarm, up to a safety bound.
+   */
   protected override async onDeadline(now: number): Promise<void> {
-    const room = this.state;
-    if (room === null) return;
-    const ttlEnd = room.createdAt + GAME_CONFIG.timers.room_ttl_seconds * 1000;
-    if (
-      room.status === "WAITING" &&
-      ttlEnd <= now &&
-      room.players.length < GAME_CONFIG.players.min
-    ) {
-      await this.closeRoom();
-    } else if (
-      room.status === "COUNTDOWN" &&
-      room.countdownEndsAt !== null &&
-      room.countdownEndsAt <= now
-    ) {
-      await this.startGame();
-    } else if (room.status === "PLAYING" && room.game !== null && room.game.turnDeadline <= now) {
-      // Automatic action of the current player (cahier §7.3, §9); no-op if not due.
-      await this.applyGameResult(applyTimeout(room.game, this.rng, now));
-    } else if (
-      room.status === "FINISHED" &&
-      room.finishedAt !== null &&
-      room.finishedAt + CLOSE_AFTER_FINISH_MS <= now
-    ) {
-      await this.closeRoom();
+    for (let i = 0; i < MAX_DEADLINES_PER_ALARM; i++) {
+      const room = this.state;
+      if (room === null) return;
+      const due = dueDeadlines(this.deadlineInput(room), TIMERS, now)[0];
+      if (due === undefined) return;
+      const before = JSON.stringify(room);
+      await this.handleDeadline(due, now);
+      if (JSON.stringify(this.state) === before) return; // nothing changed: stop
     }
+  }
+
+  private async handleDeadline(deadline: Deadline, now: number): Promise<void> {
+    const room = this.room();
+    switch (deadline.kind) {
+      case "ROOM_TTL":
+        // §2.1.4 — fewer than 2 players 300 s after creation: the room is destroyed.
+        await this.closeRoom();
+        return;
+      case "COUNTDOWN":
+        await this.startGame();
+        return;
+      case "TURN":
+        // Automatic action of the current player (cahier §7.3, §9); no-op if not due.
+        if (room.game !== null) await this.applyGameResult(applyTimeout(room.game, this.rng, now));
+        return;
+      case "GAME_LIMIT":
+        await this.abortGame();
+        return;
+      case "CLOSE":
+        await this.closeRoom();
+        return;
+    }
+  }
+
+  private deadlineInput(room: RoomState) {
+    return {
+      status: room.status,
+      createdAt: room.createdAt,
+      playerCount: room.players.length,
+      countdownEndsAt: room.countdownEndsAt,
+      turnDeadline: room.game?.turnDeadline ?? null,
+      startedAt: room.startedAt,
+      finishedAt: room.finishedAt,
+    };
   }
 
   // ---------- Waiting room (protocole §4.1, cahier §2.1) ----------
@@ -253,7 +281,7 @@ export class RoomDO extends ProtocolObject<"room"> {
 
     const room = this.room();
     if (!this.isPlayer(userId)) {
-      room.players.push({ id: userId, pseudo: check.pseudo, joinedAt: Date.now() });
+      room.players.push({ id: userId, pseudo: check.pseudo, joinedAt: this.clock() });
       const player = this.publicPlayers().find((p) => p.id === userId);
       if (player !== undefined) this.broadcast({ t: "PLAYER_JOINED", player }, userId);
     }
@@ -267,7 +295,8 @@ export class RoomDO extends ProtocolObject<"room"> {
       room.players.length >= GAME_CONFIG.players.min
     ) {
       room.status = "COUNTDOWN";
-      room.countdownEndsAt = Date.now() + GAME_CONFIG.timers.public_start_countdown_seconds * 1000;
+      room.countdownEndsAt =
+        this.clock() + GAME_CONFIG.timers.public_start_countdown_seconds * 1000;
       this.broadcast({ t: "COUNTDOWN_STARTED", endsAt: room.countdownEndsAt });
     }
     await this.save();
@@ -293,7 +322,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     if (room.status === "PLAYING" && room.game !== null) {
       // LEAVE during the game = abandon (protocole §6.1, cahier §9).
       this.ack(ws, id);
-      await this.applyGameResult(applyForfeit(room.game, userId, "LEFT", Date.now()));
+      await this.applyGameResult(applyForfeit(room.game, userId, "LEFT", this.clock()));
       return;
     }
     if (room.status !== "WAITING" && room.status !== "COUNTDOWN") {
@@ -424,7 +453,7 @@ export class RoomDO extends ProtocolObject<"room"> {
   /** PLAYING: deals the cards (rules engine) and announces the game (protocole §6.2). */
   private beginGame(gameId: string, debited: string[]): void {
     const room = this.room();
-    const now = Date.now();
+    const now = this.clock();
     const game = createGame(
       toEngineConfig(GAME_CONFIG),
       room.options,
@@ -434,6 +463,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       gameId,
     );
     room.status = "PLAYING";
+    room.startedAt = now;
     room.debited = debited;
     room.pot = room.fee * debited.length;
     room.game = game;
@@ -466,7 +496,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     }
     let result: ActionResult;
     try {
-      const now = Date.now();
+      const now = this.clock();
       if (message.t === "PLAY") {
         const input: PlayInput = {
           cards: message.cards,
@@ -512,12 +542,31 @@ export class RoomDO extends ProtocolObject<"room"> {
     await this.reschedule();
   }
 
+  /**
+   * Game still running 2 h after its start (protocole §9): aborted for a technical reason,
+   * every debited player is refunded (spécification des jetons §7).
+   */
+  private async abortGame(): Promise<void> {
+    const room = this.room();
+    const game = room.game;
+    if (room.status !== "PLAYING" || game === null) return;
+    room.game = { ...game, status: "FINISHED" };
+    await this.finishGame({
+      t: "GAME_OVER",
+      result: "ABORTED",
+      winnerId: null,
+      reason: "TECHNICAL",
+      hands: Object.fromEntries(Object.entries(game.hands).map(([id, h]) => [id, [...h]])),
+    });
+    await this.reschedule();
+  }
+
   /** GAME_OVER with the amounts, then settlement or refund (spécification des jetons §6.4, §7). */
   private async finishGame(event: GameOverEvent): Promise<void> {
     const room = this.room();
     const settlement = computeSettlement(room.pot, this.services.commissionPercent, event.result);
     room.status = "FINISHED";
-    room.finishedAt = Date.now();
+    room.finishedAt = this.clock();
     this.broadcast({ ...event, ...settlement });
     await this.save();
     const gameId = room.gameId ?? "";
@@ -557,7 +606,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       this.broadcast({ t: "HOST_CHANGED", hostId: first.id });
     }
     if (room.status === "COUNTDOWN" && room.players.length < GAME_CONFIG.players.min) {
-      const endsAt = room.countdownEndsAt ?? Date.now();
+      const endsAt = room.countdownEndsAt ?? this.clock();
       room.status = "WAITING";
       room.countdownEndsAt = null;
       this.broadcast({ t: "COUNTDOWN_CANCELLED", endsAt });
@@ -609,7 +658,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       me: room.game === null ? { id: userId, hand: [] } : getPlayerView(room.game, userId).me,
       ...(room.game === null ? {} : { game: this.gameView(room.game, userId) }),
       seq: room.seq,
-      serverTime: Date.now(),
+      serverTime: this.clock(),
     };
   }
 

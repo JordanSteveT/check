@@ -284,6 +284,13 @@ Un Durable Object n'a qu'**une alarme** : le RoomDO garde une liste d'échéance
 
 Le gestionnaire d'alarme est **idempotent** : il relit l'heure et l'état, et ne fait rien si l'échéance a déjà été traitée.
 
+**Précisions (SRV-06) :**
+
+* L'alarme traite, dans l'ordre chronologique, **toutes** les échéances dues (par exemple plusieurs joueurs déconnectés à la suite), dans la limite de 50 par déclenchement, puis se réarme sur la suivante. Une alarme en retard ne joue qu'une action automatique pour le joueur courant : le tour suivant part de l'heure de traitement.
+* La vie du salon en attente n'est une échéance que tant qu'il compte moins de 2 joueurs.
+* Partie trop longue : `GAME_OVER` avec `result: ABORTED`, `reason: TECHNICAL`, `winnerId: null`, commission et gain à 0, puis `refund_game` pour tous les joueurs débités.
+* Durées : clés `timers.*` de `game_config.ts` (règles §11.3).
+
 ---
 
 ## 10. Horloge
@@ -338,6 +345,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.6 — 20/11/2026.** SRV-06 : précisions sur le gestionnaire d'échéances (§9).
+>
 > **Version 1.5 — 20/11/2026.** SRV-04 : précisions sur la salle d'attente (§4.1).
 >
 > **Version 1.4 — 19/11/2026.** SRV-02 : `/ws/user/{userId}` ; format de `roomId` ; réponses 404 et 426 (§2).

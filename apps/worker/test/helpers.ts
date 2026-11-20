@@ -58,6 +58,8 @@ export type Client = {
   /** Resolves when the server closes the socket. */
   closed: Promise<{ code: number; reason: string }>;
   close: () => void;
+  /** Waits `ms`, then returns (and removes) every message received and not read yet. */
+  received: (ms?: number) => Promise<Record<string, unknown>[]>;
 };
 
 /** Opens a WebSocket on `path` through the Worker. */
@@ -102,6 +104,10 @@ export async function connect(path: string): Promise<Client> {
     closed,
     close: () => {
       ws.close(1000, "test");
+    },
+    received: async (ms = 150) => {
+      await new Promise((resolve) => setTimeout(resolve, ms));
+      return inbox.splice(0, inbox.length);
     },
   };
 }
