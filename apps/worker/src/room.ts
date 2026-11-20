@@ -118,6 +118,11 @@ export class RoomDO extends ProtocolObject<"room"> {
   /** Random generator of the game. Public so that tests can use a seeded one. */
   rng: Rng = cryptoRng;
   private state: RoomState | null = null;
+  /**
+   * Messages waiting for the state to be saved: nothing reaches a client before the state it
+   * describes is durable, so a restart never loses a move that a player has seen (SRV-07).
+   */
+  private outbox: { ws: WebSocket; message: unknown }[] = [];
 
   constructor(ctx: DurableObjectState, env: ConstructorParameters<typeof ProtocolObject>[1]) {
     super(ctx, env);
@@ -151,7 +156,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       startedAt: null,
       finishedAt: null,
     };
-    await this.save();
+    await this.commit();
     await this.reschedule();
   }
 
@@ -171,6 +176,18 @@ export class RoomDO extends ProtocolObject<"room"> {
     userId: string,
     message: ActionMessage<"room">,
   ): Promise<void> {
+    try {
+      await this.handleMessage(ws, userId, message);
+    } finally {
+      await this.commit();
+    }
+  }
+
+  private async handleMessage(
+    ws: WebSocket,
+    userId: string,
+    message: ActionMessage<"room">,
+  ): Promise<void> {
     switch (message.t) {
       case "JOIN":
         return this.join(ws, userId, message.id);
@@ -182,7 +199,7 @@ export class RoomDO extends ProtocolObject<"room"> {
         return this.start(ws, userId, message.id);
       case "SYNC":
         this.ack(ws, message.id);
-        this.send(ws, { t: "STATE", view: this.viewFor(userId) });
+        this.queue(ws, { t: "STATE", view: this.viewFor(userId) });
         return;
       case "PLAY":
       case "DRAW":
@@ -210,6 +227,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       if (due === undefined) return;
       const before = JSON.stringify(room);
       await this.handleDeadline(due, now);
+      await this.commit();
       if (JSON.stringify(this.state) === before) return; // nothing changed: stop
     }
   }
@@ -255,7 +273,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     if (this.isPlayer(userId)) {
       // Already seated (new tab, reconnection): just resend the state.
       this.ack(ws, id);
-      this.send(ws, { t: "STATE", view: this.viewFor(userId) });
+      this.queue(ws, { t: "STATE", view: this.viewFor(userId) });
       return;
     }
     const refused = this.joinRefusal();
@@ -286,7 +304,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       if (player !== undefined) this.broadcast({ t: "PLAYER_JOINED", player }, userId);
     }
     this.ack(ws, id);
-    this.send(ws, { t: "STATE", view: this.viewFor(userId) });
+    this.queue(ws, { t: "STATE", view: this.viewFor(userId) });
 
     // §2.1.2 — the public countdown starts when the 2nd player arrives, and is not reset.
     if (
@@ -299,7 +317,7 @@ export class RoomDO extends ProtocolObject<"room"> {
         this.clock() + GAME_CONFIG.timers.public_start_countdown_seconds * 1000;
       this.broadcast({ t: "COUNTDOWN_STARTED", endsAt: room.countdownEndsAt });
     }
-    await this.save();
+    await this.commit();
     // §2.1.3 — full table: immediate start, whatever the room type.
     if (room.players.length >= GAME_CONFIG.players.max) await this.startGame();
     else await this.reschedule();
@@ -332,7 +350,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     }
     if (this.isPlayer(userId)) this.removePlayer(userId, "LEFT");
     this.ack(ws, id);
-    await this.save();
+    await this.commit();
     await this.reschedule();
   }
 
@@ -368,7 +386,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     room.fee = fee;
     this.ack(ws, id);
     this.broadcast({ t: "OPTIONS_UPDATED", options: room.options, fee });
-    await this.save();
+    await this.commit();
   }
 
   private optionsRefusal(userId: string): ErrorCode | null {
@@ -413,7 +431,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     room.countdownEndsAt = null;
     room.gameId = gameId;
     this.broadcast({ t: "GAME_STARTING" });
-    await this.save();
+    await this.commit();
 
     const ids = room.players.map((p) => p.id);
     let failed: string[];
@@ -424,7 +442,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     }
     for (const playerId of failed) {
       for (const socket of this.sockets(playerId)) {
-        this.send(socket, {
+        this.queue(socket, {
           t: "ERROR",
           code: "INSUFFICIENT_BALANCE",
           message: "Entry fee could not be debited",
@@ -440,13 +458,13 @@ export class RoomDO extends ProtocolObject<"room"> {
       room.gameId = null;
       for (const player of room.players) {
         for (const socket of this.sockets(player.id)) {
-          this.send(socket, { t: "STATE", view: this.viewFor(player.id) });
+          this.queue(socket, { t: "STATE", view: this.viewFor(player.id) });
         }
       }
     } else {
       this.beginGame(gameId, debited);
     }
-    await this.save();
+    await this.commit();
     await this.reschedule();
   }
 
@@ -479,7 +497,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     });
     for (const id of game.seats) {
       for (const socket of this.sockets(id)) {
-        this.send(socket, { t: "HAND", cards: game.hands[id] ?? [] });
+        this.queue(socket, { t: "HAND", cards: game.hands[id] ?? [] });
       }
     }
   }
@@ -529,7 +547,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     for (const event of result.events) {
       if (event.t === "YOU_DREW") {
         for (const socket of this.sockets(event.playerId)) {
-          this.send(socket, { t: "YOU_DREW", cards: event.cards });
+          this.queue(socket, { t: "YOU_DREW", cards: event.cards });
         }
       } else if (event.t === "GAME_OVER") {
         over = event;
@@ -538,7 +556,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       }
     }
     if (over !== null) await this.finishGame(over);
-    await this.save();
+    await this.commit();
     await this.reschedule();
   }
 
@@ -568,7 +586,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     room.status = "FINISHED";
     room.finishedAt = this.clock();
     this.broadcast({ ...event, ...settlement });
-    await this.save();
+    await this.commit();
     const gameId = room.gameId ?? "";
     try {
       if (event.winnerId !== null && event.result === "WIN") {
@@ -590,7 +608,7 @@ export class RoomDO extends ProtocolObject<"room"> {
   /** §2.1.4 — the room is destroyed: every connection is closed with 4004. */
   private async closeRoom(): Promise<void> {
     this.room().status = "CLOSED";
-    await this.save();
+    await this.commit();
     for (const ws of this.ctx.getWebSockets()) ws.close(CLOSE_CODES.ROOM_CLOSED, "ROOM_CLOSED");
   }
 
@@ -686,19 +704,26 @@ export class RoomDO extends ProtocolObject<"room"> {
     const message = { ...event, seq: room.seq };
     for (const player of room.players) {
       if (player.id === exceptUserId) continue;
-      for (const socket of this.sockets(player.id)) this.send(socket, message);
+      for (const socket of this.sockets(player.id)) this.queue(socket, message);
     }
   }
 
   private ack(ws: WebSocket, id: string): void {
-    this.send(ws, { t: "ACK", id });
+    this.queue(ws, { t: "ACK", id });
   }
 
   private error(ws: WebSocket, id: string, code: ErrorCode): void {
-    this.send(ws, { t: "ERROR", id, code, message: code });
+    this.queue(ws, { t: "ERROR", id, code, message: code });
   }
 
-  private async save(): Promise<void> {
-    await this.ctx.storage.put(STORAGE_KEY, this.state);
+  /** Queues a message; it is sent by the next `commit`. */
+  private queue(ws: WebSocket, message: unknown): void {
+    this.outbox.push({ ws, message });
+  }
+
+  /** Saves the state, then sends the queued messages (in order). */
+  private async commit(): Promise<void> {
+    if (this.state !== null) await this.ctx.storage.put(STORAGE_KEY, this.state);
+    for (const { ws, message } of this.outbox.splice(0)) this.send(ws, message);
   }
 }

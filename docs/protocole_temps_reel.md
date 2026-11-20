@@ -257,6 +257,8 @@ Toutes exigent l'en-tête `Authorization: Bearer <jeton Supabase>`. Les opérati
 5. Côté serveur, la déconnexion déclenche les règles du cahier des charges §9 (délai de grâce de 60 s pendant son tour, puis actions automatiques, forfait après 3 tours manqués).
 6. **Un seul WebSocket par joueur et par salon** : une nouvelle connexion du même joueur ferme l'ancienne (code 4003).
 
+**Persistance du salon (SRV-07) :** l'état du salon (salle d'attente, partie, `seq`) est enregistré dans le stockage du RoomDO **avant** l'envoi de tout message qui en découle (`ACK`, événements, `STATE`). Un redémarrage du RoomDO ne perd donc aucun coup qu'un joueur a vu : le nouvel exemplaire relit l'état, l'alarme reste armée, et les joueurs qui se reconnectent reçoivent la partie sauvegardée avec `JOIN` (ou `SYNC`).
+
 ---
 
 ## 8. Limites
@@ -345,6 +347,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.7 — 20/11/2026.** SRV-07 : persistance du salon avant tout envoi (§7).
+>
 > **Version 1.6 — 20/11/2026.** SRV-06 : précisions sur le gestionnaire d'échéances (§9).
 >
 > **Version 1.5 — 20/11/2026.** SRV-04 : précisions sur la salle d'attente (§4.1).
