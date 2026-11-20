@@ -1,6 +1,7 @@
 // Bindings of the Worker (wrangler.jsonc) and server configuration read from them.
 
-import type { LobbyDO, RoomDO, UserDO } from "./durable_objects.js";
+import type { LobbyDO, UserDO } from "./durable_objects.js";
+import type { RoomDO } from "./room.js";
 
 export type Env = {
   ROOM: DurableObjectNamespace<RoomDO>;

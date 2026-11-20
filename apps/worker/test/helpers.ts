@@ -126,3 +126,30 @@ export async function authenticated(path: string, token?: string): Promise<Clien
   if (reply["t"] !== "AUTH_OK") throw new Error(`expected AUTH_OK, got ${JSON.stringify(reply)}`);
   return client;
 }
+
+export const DEFAULT_OPTIONS = {
+  two_transparent: true,
+  jack_commands: true,
+  jack_wild: true,
+  ace_skips: true,
+  seven_draw_two: true,
+  joker_draw_four: true,
+  joker_wild: true,
+  allow_multiples: true,
+};
+
+/** Creates and initializes a room (what `POST /api/rooms` will do); returns its id. */
+export async function createRoom(
+  init: Partial<{ type: "PRIVATE" | "PUBLIC"; fee: number; hostId: string; code: string }> = {},
+): Promise<string> {
+  const id = env.ROOM.newUniqueId();
+  const type = init.type ?? "PRIVATE";
+  await env.ROOM.get(id).init({
+    type,
+    fee: init.fee ?? 200,
+    options: DEFAULT_OPTIONS,
+    hostId: init.hostId ?? USER_ID,
+    ...(type === "PRIVATE" ? { code: init.code ?? "ABC123" } : {}),
+  });
+  return id.toString();
+}

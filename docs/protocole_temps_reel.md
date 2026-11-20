@@ -112,6 +112,16 @@ Les 54 identifiants sont uniques : ils servent directement d'identifiants de car
 | `FINISHED` | `SYNC`, `LEAVE` | `CLOSED` après 60 s |
 | `CLOSED` | Aucune | Les connexions sont fermées avec le code 4004 |
 
+**Précisions (SRV-04) :**
+
+* Un salon qui n'a pas été créé par `POST /api/rooms` (ou qui est `CLOSED`) ferme toute nouvelle connexion avec le code **4004**.
+* Le rôle d'hôte passe au joueur arrivé le plus tôt quand l'hôte quitte le salon, **privé ou public** (règles §2.1.5 ; dans un salon public, l'hôte sert seulement à `UPDATE_OPTIONS`).
+* `START` dans un salon public : `ERROR NOT_HOST` (pas de lancement manuel). `UPDATE_OPTIONS` hors de `WAITING` : `ROOM_LOCKED` (`ROOM_STARTING` pendant `STARTING`). Une action de jeu (`PLAY`, `DRAW`, `CALL_CHECK`) hors de `PLAYING` : `NOT_YOUR_TURN`.
+* Un joueur dont la connexion se coupe en salle d'attente **reste assis** (affiché déconnecté) ; il quitte le salon seulement avec `LEAVE`.
+* Durée de vie : 300 s après la création, un salon `WAITING` de moins de 2 joueurs est fermé ; passé ce délai, il est fermé dès qu'il redescend sous 2 joueurs en `WAITING`.
+* `STARTING` → `WAITING` (moins de 2 joueurs débités) : chaque joueur restant reçoit un `STATE` à jour (aucun événement dédié).
+* L'arrivée de chaque joueur est un événement numéroté (`PLAYER_JOINED`), même s'il est seul : le `STATE` reçu après `JOIN` porte le `seq` de son propre `PLAYER_JOINED`, qui ne lui est pas renvoyé.
+
 ### 4.2 Partie (état du moteur)
 
 | Champ | Type | Sens |
@@ -328,6 +338,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.5 — 20/11/2026.** SRV-04 : précisions sur la salle d'attente (§4.1).
+>
 > **Version 1.4 — 19/11/2026.** SRV-02 : `/ws/user/{userId}` ; format de `roomId` ; réponses 404 et 426 (§2).
 >
 > **Version 1.3 — 19/11/2026.** SRV-01 : `seq` réservé aux événements diffusés ; code `INVALID_MESSAGE` (§3, §11).

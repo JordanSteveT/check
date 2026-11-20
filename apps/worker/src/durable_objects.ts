@@ -1,6 +1,8 @@
 // Durable Objects of the game server (architecture §4). The common base handles the
 // connection protocol (protocole §2.1, §3): AUTH within the deadline, token check, version,
 // PING/PONG and message validation, with the hibernation API (state kept in attachments).
+// It also owns the single alarm of the object (protocole §9): subclasses list their own
+// deadlines and the base always arms the nearest one.
 
 import { DurableObject } from "cloudflare:workers";
 import {
@@ -30,6 +32,9 @@ type MessageOf = {
   lobby: LobbyClientMessage;
 };
 
+/** Messages left to the subclass once AUTH and PING are handled. */
+export type ActionMessage<K extends ConnectionKind> = Exclude<MessageOf[K], { t: "AUTH" | "PING" }>;
+
 /** One key provider per Supabase project and isolate, so that the JWKS cache is shared. */
 const providers = new Map<string, KeyProvider>();
 
@@ -43,11 +48,9 @@ function keyProvider(env: Env): KeyProvider {
   return provider;
 }
 
-function send(ws: WebSocket, message: unknown): void {
-  ws.send(JSON.stringify(message));
-}
+const OPEN = 1; // WebSocket.READY_STATE_OPEN
 
-abstract class ProtocolObject<K extends ConnectionKind> extends DurableObject<Env> {
+export abstract class ProtocolObject<K extends ConnectionKind> extends DurableObject<Env> {
   protected abstract readonly kind: K;
   protected readonly config: ServerConfig;
 
@@ -58,29 +61,32 @@ abstract class ProtocolObject<K extends ConnectionKind> extends DurableObject<En
 
   override async fetch(request: Request): Promise<Response> {
     const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1]);
+    if (!this.acceptsConnections()) {
+      pair[1].close(CLOSE_CODES.ROOM_CLOSED, "ROOM_CLOSED");
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
     const expectedUserId = request.headers.get(USER_ID_HEADER) ?? undefined;
     const attachment: Attachment =
       expectedUserId === undefined
         ? { phase: "pending", connectedAt: Date.now() }
         : { phase: "pending", connectedAt: Date.now(), expectedUserId };
-    this.ctx.acceptWebSocket(pair[1]);
     pair[1].serializeAttachment(attachment);
-    await this.scheduleAuthCheck(attachment.connectedAt + this.config.authTimeoutMs);
+    await this.reschedule();
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  /** Closes the sockets that did not authenticate in time, then re-arms for the others. */
+  /** Single alarm: AUTH deadlines, then the subclass deadlines; re-armed for the next one. */
   override async alarm(): Promise<void> {
     const now = Date.now();
-    let next: number | null = null;
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
-      if (att?.phase !== "pending") continue;
-      const deadline = att.connectedAt + this.config.authTimeoutMs;
-      if (deadline <= now) ws.close(CLOSE_CODES.UNAUTHORIZED, "UNAUTHORIZED");
-      else next = next === null ? deadline : Math.min(next, deadline);
+      if (att?.phase === "pending" && att.connectedAt + this.config.authTimeoutMs <= now) {
+        ws.close(CLOSE_CODES.UNAUTHORIZED, "UNAUTHORIZED");
+      }
     }
-    if (next !== null) await this.ctx.storage.setAlarm(next);
+    await this.onDeadline(now);
+    await this.reschedule();
   }
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
@@ -102,7 +108,7 @@ abstract class ProtocolObject<K extends ConnectionKind> extends DurableObject<En
       return;
     }
     if (parsed === null) {
-      send(ws, {
+      this.send(ws, {
         t: "ERROR",
         code: "INVALID_MESSAGE",
         message: "Binary messages are not supported",
@@ -110,38 +116,83 @@ abstract class ProtocolObject<K extends ConnectionKind> extends DurableObject<En
       return;
     }
     if (!parsed.ok) {
-      if (parsed.error !== undefined) send(ws, parsed.error);
+      if (parsed.error !== undefined) this.send(ws, parsed.error);
       return;
     }
     const message = parsed.message;
     if (message.t === "AUTH") {
       await this.authenticate(ws, att, message);
     } else if (message.t === "PING") {
-      send(ws, { t: "PONG", c: message.c, s: Date.now() });
+      this.send(ws, { t: "PONG", c: message.c, s: Date.now() });
     } else {
-      await this.onMessage(
-        ws,
-        att.userId,
-        message as Exclude<MessageOf[K], { t: "AUTH" | "PING" }>,
-      );
+      await this.onMessage(ws, att.userId, message as ActionMessage<K>);
     }
   }
 
-  override webSocketClose(ws: WebSocket): void {
+  override async webSocketClose(ws: WebSocket): Promise<void> {
     // Answer the client's close frame (codes such as 1005/1006 cannot be echoed).
     ws.close();
+    const att = ws.deserializeAttachment() as Attachment | null;
+    if (att?.phase === "authed") await this.onSocketClosed(att.userId);
   }
 
-  /**
-   * Handles a validated message from an authenticated player. Implemented by each object in
-   * the following tickets (SRV-04 room, SRV-09 user, SRV-10 lobby).
-   */
+  // ---------- Hooks for the subclasses ----------
+
+  /** Whether new connections are accepted (otherwise they are closed with 4004). */
+  protected acceptsConnections(): boolean {
+    return true;
+  }
+
+  /** Handles a validated message from an authenticated player. */
   protected onMessage(
     _ws: WebSocket,
     _userId: string,
-    _message: Exclude<MessageOf[K], { t: "AUTH" | "PING" }>,
+    _message: ActionMessage<K>,
   ): Promise<void> | void {
-    // Nothing yet.
+    // Implemented by each object (SRV-04 room, SRV-09 user, SRV-10 lobby).
+  }
+
+  /** Deadlines of the subclass (ms); the nearest one, if any, arms the alarm. */
+  protected deadlines(): number[] {
+    return [];
+  }
+
+  /** Called by the alarm; handles the subclass deadlines that are due at `now`. */
+  protected onDeadline(_now: number): Promise<void> | void {
+    // Nothing by default.
+  }
+
+  /** Called after an authenticated socket closed. */
+  protected onSocketClosed(_userId: string): Promise<void> | void {
+    // Nothing by default.
+  }
+
+  // ---------- Helpers ----------
+
+  protected send(ws: WebSocket, message: unknown): void {
+    if (ws.readyState === OPEN) ws.send(JSON.stringify(message));
+  }
+
+  /** Open, authenticated sockets of a player (or of everyone). */
+  protected sockets(userId?: string): WebSocket[] {
+    return this.ctx.getWebSockets().filter((ws) => {
+      if (ws.readyState !== OPEN) return false;
+      const att = ws.deserializeAttachment() as Attachment | null;
+      return att?.phase === "authed" && (userId === undefined || att.userId === userId);
+    });
+  }
+
+  /** Arms the alarm for the nearest deadline, or removes it if there is none. */
+  protected async reschedule(): Promise<void> {
+    const times = [...this.deadlines()];
+    for (const ws of this.ctx.getWebSockets()) {
+      const att = ws.deserializeAttachment() as Attachment | null;
+      if (att?.phase === "pending" && ws.readyState === OPEN) {
+        times.push(att.connectedAt + this.config.authTimeoutMs);
+      }
+    }
+    if (times.length === 0) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Math.min(...times));
   }
 
   /** First AUTH, or a later AUTH with a refreshed token (§2.1, step 5). */
@@ -167,19 +218,9 @@ abstract class ProtocolObject<K extends ConnectionKind> extends DurableObject<En
       connectedAt: att.connectedAt,
     };
     ws.serializeAttachment(authed);
-    send(ws, { t: "AUTH_OK", userId: result.userId, serverTime: Date.now() });
+    this.send(ws, { t: "AUTH_OK", userId: result.userId, serverTime: Date.now() });
+    if (att.phase === "pending") await this.reschedule();
   }
-
-  /** Arms the alarm for `at` unless an earlier one is already set. */
-  private async scheduleAuthCheck(at: number): Promise<void> {
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || current > at) await this.ctx.storage.setAlarm(at);
-  }
-}
-
-/** One object per room: waiting room and game. */
-export class RoomDO extends ProtocolObject<"room"> {
-  protected readonly kind = "room";
 }
 
 /** One object per player: presence and current room. */

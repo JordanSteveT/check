@@ -4,7 +4,8 @@ import { USER_ID_HEADER } from "./durable_objects.js";
 import type { Env } from "./env.js";
 import { matchRoute, type ApiRouteName, type Route } from "./router.js";
 
-export { LobbyDO, RoomDO, UserDO } from "./durable_objects.js";
+export { LobbyDO, UserDO } from "./durable_objects.js";
+export { RoomDO } from "./room.js";
 
 /** Name of the single LobbyDO instance (not exported: workerd only accepts handlers and classes as exports). */
 const LOBBY_NAME = "lobby";
