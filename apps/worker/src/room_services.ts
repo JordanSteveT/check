@@ -22,6 +22,12 @@ export interface RoomServices {
   debitEntryFees(gameId: string, playerIds: string[], fee: number): Promise<{ failed: string[] }>;
   /** Refunds the entry fees already debited (§6.3, step 3). */
   refundEntryFees(gameId: string, playerIds: string[], fee: number): Promise<void>;
+  /** `economy.house_commission_percent` (Supabase `app_config`). */
+  readonly commissionPercent: number;
+  /** End of a game with a winner: `settle_game` (§6.4). */
+  settleGame(gameId: string, winnerId: string, payout: number, commission: number): Promise<void>;
+  /** Draw or aborted game: `refund_game`, every debited player gets the fee back (§7). */
+  refundGame(gameId: string, playerIds: string[], fee: number): Promise<void>;
 }
 
 /** Default values of `app_config` (spécification des jetons §12). */
@@ -33,4 +39,7 @@ export const LOCAL_ROOM_SERVICES: RoomServices = {
   checkCanJoin: (userId) => Promise.resolve({ ok: true, pseudo: `Joueur ${userId.slice(0, 4)}` }),
   debitEntryFees: () => Promise.resolve({ failed: [] }),
   refundEntryFees: () => Promise.resolve(),
+  commissionPercent: 10,
+  settleGame: () => Promise.resolve(),
+  refundGame: () => Promise.resolve(),
 };

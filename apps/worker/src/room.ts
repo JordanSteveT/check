@@ -1,8 +1,24 @@
-// RoomDO: one object per room (architecture §4). This file covers the waiting room
-// (protocole §4.1): JOIN, LEAVE, host, UPDATE_OPTIONS, START, public countdown, room lifetime,
-// and the STARTING step (entry fees). The game itself (PLAYING) arrives with SRV-05.
+// RoomDO: one object per room (architecture §4): the waiting room (protocole §4.1: JOIN,
+// LEAVE, host, UPDATE_OPTIONS, START, public countdown, room lifetime), the STARTING step
+// (entry fees), then the game (PLAYING) driven by the rules engine, and FINISHED.
 
-import type { RoomOptions } from "@check/engine";
+import {
+  EngineError,
+  applyCheckCall,
+  applyDraw,
+  applyForfeit,
+  applyPlay,
+  applyTimeout,
+  createGame,
+  getPlayerView,
+  type ActionResult,
+  type EngineEvent,
+  type GameOverEvent,
+  type GameState,
+  type PlayInput,
+  type Rng,
+  type RoomOptions,
+} from "@check/engine";
 import {
   CLOSE_CODES,
   RoomOptionsSchema,
@@ -13,8 +29,9 @@ import {
   type RoomType,
 } from "@check/protocol";
 import { ProtocolObject, type ActionMessage } from "./durable_objects.js";
-import { GAME_CONFIG } from "./game_config.js";
+import { GAME_CONFIG, toEngineConfig } from "./game_config.js";
 import { LOCAL_ROOM_SERVICES, type RoomServices } from "./room_services.js";
+import { computeSettlement } from "./settlement.js";
 
 /** Parameters given by `POST /api/rooms` (already validated by the Worker). */
 export type RoomInit = {
@@ -45,6 +62,12 @@ export type RoomState = {
   seq: number;
   gameId: string | null;
   pot: number;
+  /** Players whose entry fee was debited (refunded on a draw, §7). */
+  debited: string[];
+  /** Rules engine state while PLAYING and after the end (for the last STATE). */
+  game: GameState | null;
+  /** End of the game; the room closes 60 s later (protocole §9). */
+  finishedAt: number | null;
 };
 
 /** Events broadcast to the players, before `seq` is added. */
@@ -55,14 +78,35 @@ type RoomEvent =
   | { t: "OPTIONS_UPDATED"; options: RoomOptions; fee: number }
   | { t: "COUNTDOWN_STARTED"; endsAt: number }
   | { t: "COUNTDOWN_CANCELLED"; endsAt: number }
-  | { t: "GAME_STARTING" };
+  | { t: "GAME_STARTING" }
+  | {
+      t: "GAME_STARTED";
+      gameId: string;
+      pot: number;
+      seats: string[];
+      starterCard: string;
+      currentPlayerId: string;
+      turnDeadline: number;
+      handCounts: Record<string, number>;
+    }
+  | Exclude<EngineEvent, { t: "YOU_DREW" | "GAME_OVER" }>
+  | (GameOverEvent & { pot: number; commission: number; payout: number });
+
+type GameMessage = Extract<ActionMessage<"room">, { t: "PLAY" | "DRAW" | "CALL_CHECK" }>;
 
 const STORAGE_KEY = "room";
+/** Delay between the end of the game and the closing of the room (protocole §9). */
+const CLOSE_AFTER_FINISH_MS = 60_000;
+
+/** Cryptographically secure generator for dealing and reshuffling (cahier B6). */
+const cryptoRng: Rng = () => (crypto.getRandomValues(new Uint32Array(1))[0] ?? 0) / 4294967296;
 
 export class RoomDO extends ProtocolObject<"room"> {
   protected readonly kind = "room";
   /** External services (Supabase, UserDO). Public so that tests can replace them. */
   services: RoomServices = LOCAL_ROOM_SERVICES;
+  /** Random generator of the game. Public so that tests can use a seeded one. */
+  rng: Rng = cryptoRng;
   private state: RoomState | null = null;
 
   constructor(ctx: DurableObjectState, env: ConstructorParameters<typeof ProtocolObject>[1]) {
@@ -92,6 +136,9 @@ export class RoomDO extends ProtocolObject<"room"> {
       seq: 0,
       gameId: null,
       pot: 0,
+      debited: [],
+      game: null,
+      finishedAt: null,
     };
     await this.save();
     await this.reschedule();
@@ -129,13 +176,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       case "PLAY":
       case "DRAW":
       case "CALL_CHECK":
-        // The game (PLAYING) is handled from SRV-05 on.
-        this.error(
-          ws,
-          message.id,
-          this.room().status === "STARTING" ? "ROOM_STARTING" : "NOT_YOUR_TURN",
-        );
-        return;
+        return this.gameAction(ws, userId, message);
     }
   }
 
@@ -145,6 +186,10 @@ export class RoomDO extends ProtocolObject<"room"> {
     if (room.status === "WAITING")
       return [room.createdAt + GAME_CONFIG.timers.room_ttl_seconds * 1000];
     if (room.status === "COUNTDOWN" && room.countdownEndsAt !== null) return [room.countdownEndsAt];
+    if (room.status === "PLAYING" && room.game !== null) return [room.game.turnDeadline];
+    if (room.status === "FINISHED" && room.finishedAt !== null) {
+      return [room.finishedAt + CLOSE_AFTER_FINISH_MS];
+    }
     return [];
   }
 
@@ -164,6 +209,15 @@ export class RoomDO extends ProtocolObject<"room"> {
       room.countdownEndsAt <= now
     ) {
       await this.startGame();
+    } else if (room.status === "PLAYING" && room.game !== null && room.game.turnDeadline <= now) {
+      // Automatic action of the current player (cahier §7.3, §9); no-op if not due.
+      await this.applyGameResult(applyTimeout(room.game, this.rng, now));
+    } else if (
+      room.status === "FINISHED" &&
+      room.finishedAt !== null &&
+      room.finishedAt + CLOSE_AFTER_FINISH_MS <= now
+    ) {
+      await this.closeRoom();
     }
   }
 
@@ -236,8 +290,14 @@ export class RoomDO extends ProtocolObject<"room"> {
       this.error(ws, id, "ROOM_STARTING");
       return;
     }
+    if (room.status === "PLAYING" && room.game !== null) {
+      // LEAVE during the game = abandon (protocole §6.1, cahier §9).
+      this.ack(ws, id);
+      await this.applyGameResult(applyForfeit(room.game, userId, "LEFT", Date.now()));
+      return;
+    }
     if (room.status !== "WAITING" && room.status !== "COUNTDOWN") {
-      // PLAYING (abandon) is handled from SRV-05 on; after the game, leaving changes nothing.
+      // After the game, leaving changes nothing.
       this.ack(ws, id);
       return;
     }
@@ -355,12 +415,127 @@ export class RoomDO extends ProtocolObject<"room"> {
         }
       }
     } else {
-      room.status = "PLAYING";
-      room.pot = room.fee * debited.length;
-      // createGame, GAME_STARTED and HAND: SRV-05.
+      this.beginGame(gameId, debited);
     }
     await this.save();
     await this.reschedule();
+  }
+
+  /** PLAYING: deals the cards (rules engine) and announces the game (protocole §6.2). */
+  private beginGame(gameId: string, debited: string[]): void {
+    const room = this.room();
+    const now = Date.now();
+    const game = createGame(
+      toEngineConfig(GAME_CONFIG),
+      room.options,
+      room.players.map((p) => p.id),
+      this.rng,
+      now,
+      gameId,
+    );
+    room.status = "PLAYING";
+    room.debited = debited;
+    room.pot = room.fee * debited.length;
+    room.game = game;
+    this.broadcast({
+      t: "GAME_STARTED",
+      gameId,
+      pot: room.pot,
+      seats: game.seats,
+      starterCard: game.discard[game.discard.length - 1] ?? "",
+      currentPlayerId: game.currentPlayerId,
+      turnDeadline: game.turnDeadline,
+      handCounts: Object.fromEntries(game.seats.map((id) => [id, game.hands[id]?.length ?? 0])),
+    });
+    for (const id of game.seats) {
+      for (const socket of this.sockets(id)) {
+        this.send(socket, { t: "HAND", cards: game.hands[id] ?? [] });
+      }
+    }
+  }
+
+  // ---------- Game (PLAYING) ----------
+
+  private async gameAction(ws: WebSocket, userId: string, message: GameMessage): Promise<void> {
+    const room = this.room();
+    if (room.status !== "PLAYING" || room.game === null) {
+      let code: ErrorCode = message.t === "CALL_CHECK" ? "NO_CHECK_TO_CALL" : "NOT_YOUR_TURN";
+      if (room.status === "STARTING") code = "ROOM_STARTING";
+      this.error(ws, message.id, code);
+      return;
+    }
+    let result: ActionResult;
+    try {
+      const now = Date.now();
+      if (message.t === "PLAY") {
+        const input: PlayInput = {
+          cards: message.cards,
+          ...(message.suit === undefined ? {} : { suit: message.suit }),
+          ...(message.declareCheck === undefined ? {} : { declareCheck: message.declareCheck }),
+        };
+        result = applyPlay(room.game, userId, input, this.rng, now);
+      } else if (message.t === "DRAW") {
+        result = applyDraw(room.game, userId, this.rng, now);
+      } else {
+        result = applyCheckCall(room.game, userId, message.targetId, this.rng);
+      }
+    } catch (err) {
+      if (err instanceof EngineError) {
+        this.error(ws, message.id, err.code);
+        return;
+      }
+      throw err;
+    }
+    this.ack(ws, message.id);
+    await this.applyGameResult(result);
+  }
+
+  /** Stores the new engine state and sends its events (private ones to their recipient). */
+  private async applyGameResult(result: ActionResult): Promise<void> {
+    if (result.events.length === 0) return;
+    const room = this.room();
+    room.game = result.state;
+    let over: GameOverEvent | null = null;
+    for (const event of result.events) {
+      if (event.t === "YOU_DREW") {
+        for (const socket of this.sockets(event.playerId)) {
+          this.send(socket, { t: "YOU_DREW", cards: event.cards });
+        }
+      } else if (event.t === "GAME_OVER") {
+        over = event;
+      } else {
+        this.broadcast(event);
+      }
+    }
+    if (over !== null) await this.finishGame(over);
+    await this.save();
+    await this.reschedule();
+  }
+
+  /** GAME_OVER with the amounts, then settlement or refund (spécification des jetons §6.4, §7). */
+  private async finishGame(event: GameOverEvent): Promise<void> {
+    const room = this.room();
+    const settlement = computeSettlement(room.pot, this.services.commissionPercent, event.result);
+    room.status = "FINISHED";
+    room.finishedAt = Date.now();
+    this.broadcast({ ...event, ...settlement });
+    await this.save();
+    const gameId = room.gameId ?? "";
+    try {
+      if (event.winnerId !== null && event.result === "WIN") {
+        await this.services.settleGame(
+          gameId,
+          event.winnerId,
+          settlement.payout,
+          settlement.commission,
+        );
+      } else {
+        await this.services.refundGame(gameId, room.debited, room.fee);
+      }
+    } catch (err) {
+      // Retries and alerts: ECO-04.
+      console.error(JSON.stringify({ msg: "settlement failed", gameId, error: String(err) }));
+    }
   }
 
   /** §2.1.4 — the room is destroyed: every connection is closed with 4004. */
@@ -401,7 +576,15 @@ export class RoomDO extends ProtocolObject<"room"> {
   }
 
   private publicPlayers(): PlayerView["players"] {
-    return this.room().players.map((p, seat) => ({
+    const room = this.room();
+    if (room.game !== null) {
+      const pseudos = new Map(room.players.map((p) => [p.id, p.pseudo]));
+      return getPlayerView(room.game, "").players.map((p) => ({
+        ...p,
+        pseudo: pseudos.get(p.id) ?? "",
+      }));
+    }
+    return room.players.map((p, seat) => ({
       id: p.id,
       pseudo: p.pseudo,
       seat,
@@ -423,9 +606,27 @@ export class RoomDO extends ProtocolObject<"room"> {
       fee: room.fee,
       options: room.options,
       players: this.publicPlayers(),
-      me: { id: userId, hand: [] },
+      me: room.game === null ? { id: userId, hand: [] } : getPlayerView(room.game, userId).me,
+      ...(room.game === null ? {} : { game: this.gameView(room.game, userId) }),
       seq: room.seq,
       serverTime: Date.now(),
+    };
+  }
+
+  private gameView(game: GameState, userId: string): NonNullable<PlayerView["game"]> {
+    const view = getPlayerView(game, userId).game;
+    return {
+      gameId: view.gameId,
+      pot: this.room().pot,
+      topCard: view.topCard,
+      deckCount: view.deckCount,
+      currentPlayerId: view.currentPlayerId,
+      turnDeadline: view.turnDeadline,
+      penalty: view.penalty,
+      requestedSuit: view.requestedSuit,
+      openColor: view.openColor,
+      checkWindowTargetId: view.checkWindowTargetId,
+      legal: view.legal,
     };
   }
 
