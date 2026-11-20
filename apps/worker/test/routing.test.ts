@@ -2,7 +2,6 @@ import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 const BASE = "https://check.test";
-const USER_ID = "3f1c2a4e-8b7d-4c6e-9f10-112233445566";
 
 function upgrade(path: string): Promise<Response> {
   return SELF.fetch(`${BASE}${path}`, { headers: { Upgrade: "websocket" } });
@@ -74,7 +73,8 @@ describe("SRV-02 — routage des WebSockets vers les Durable Objects", () => {
   });
 
   it("/ws/user/{userId} ouvre un WebSocket (UserDO)", async () => {
-    const response = await upgrade(`/ws/user/${USER_ID}`);
+    // A fresh user id: the UserDO of another test file may be invalidated between files.
+    const response = await upgrade(`/ws/user/${crypto.randomUUID()}`);
     expect(response.status).toBe(101);
     closeSocket(response);
   });

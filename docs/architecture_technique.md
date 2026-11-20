@@ -151,7 +151,7 @@ Ce document fixe **comment** le jeu est construit. Les règles du jeu sont dans 
 | **Préproduction** | Worker `check-staging`, sous-domaine `staging.` | Projet Supabase `check-staging` (Paris) | Tests, bêta fermée, mesures de latence |
 | **Production** | Worker `check`, domaine principal | Projet Supabase `check-prod` (Paris), offre **Pro** | Joueurs |
 
-Variables d'environnement du Worker : `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` (secret), `SUPABASE_JWKS_URL`, `TURNSTILE_SITE_KEY`, `ENV` (`local`/`staging`/`production`).
+Variables d'environnement du Worker : `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` (secret), `TURNSTILE_SITE_KEY`, `ENV` (`local`/`staging`/`production`). Le JWKS est lu à `{SUPABASE_URL}/auth/v1/.well-known/jwks.json` ; l'émetteur attendu des jetons est `{SUPABASE_URL}/auth/v1` et l'audience `authenticated`. Réservées aux tests et au local : `SUPABASE_JWKS` (JWKS en ligne, remplace la lecture réseau) et `AUTH_TIMEOUT_MS` (délai d'`AUTH`, 5 000 ms par défaut). Le projet Supabase doit signer ses jetons avec des **clés asymétriques** (ES256 ou RS256) : les jetons HS256 (ancien secret partagé) sont refusés.
 
 ---
 

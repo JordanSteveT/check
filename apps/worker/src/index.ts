@@ -1,5 +1,6 @@
 // Worker entry point: routes `/api/*` to the HTTP handlers and `/ws/*` to the Durable Objects.
 
+import { USER_ID_HEADER } from "./durable_objects.js";
 import type { Env } from "./env.js";
 import { matchRoute, type ApiRouteName, type Route } from "./router.js";
 
@@ -64,7 +65,11 @@ export default {
         }
         const stub = stubFor(route, env);
         if (stub === null) return text("Not found", 404);
-        return stub.fetch(request);
+        // The expected user id comes from the URL only, never from a client header.
+        const forwarded = new Request(request);
+        forwarded.headers.delete(USER_ID_HEADER);
+        if (route.target === "user") forwarded.headers.set(USER_ID_HEADER, route.userId);
+        return stub.fetch(forwarded);
       }
     }
   },

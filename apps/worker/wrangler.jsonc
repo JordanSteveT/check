@@ -14,5 +14,7 @@
   },
   // SQLite-backed Durable Objects: available on the Workers Free plan as well as on Paid.
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RoomDO", "UserDO", "LobbyDO"] }],
+  // Not secret. Local Supabase (`supabase start`); overridden per environment at deployment.
+  "vars": { "SUPABASE_URL": "http://127.0.0.1:54321" },
   "observability": { "enabled": true },
 }
