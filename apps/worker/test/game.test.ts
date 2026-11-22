@@ -68,6 +68,8 @@ async function startedDuel(
   const roomId = await createRoom({ hostId });
   await withRoom(roomId, (instance) => {
     instance.rng = createSeededRng(seed);
+    instance.rateRule = { limit: 10_000, windowMs: 1000, maxStrikes: 3 }; // simulated play is fast
+
     instance.services = { ...LOCAL_ROOM_SERVICES, ...services };
   });
   const a = await player(roomId, hostId);

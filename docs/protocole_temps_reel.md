@@ -257,6 +257,12 @@ Toutes exigent l'en-tête `Authorization: Bearer <jeton Supabase>`. Les opérati
 5. Côté serveur, la déconnexion déclenche les règles du cahier des charges §9 (délai de grâce de 60 s pendant son tour, puis actions automatiques, forfait après 3 tours manqués).
 6. **Un seul WebSocket par joueur et par salon** : une nouvelle connexion du même joueur ferme l'ancienne (code 4003).
 
+**Précisions (SRV-08) :**
+
+* Après `AUTH`, un joueur **assis** dans le salon reçoit directement `STATE` (sans `JOIN`). En partie, le moteur le note reconnecté ; les autres joueurs reçoivent `PLAYER_CONNECTION` (`connected: true`). À la fermeture de sa dernière connexion, ils reçoivent `PLAYER_CONNECTION` (`connected: false`), en salle d'attente comme en partie.
+* La règle « une seule connexion » (4003) s'applique aux connexions **salon**. Le remplacement d'une connexion par une autre du même joueur ne produit pas de `PLAYER_CONNECTION`.
+* **Identifiant déjà traité :** le serveur garde les 200 dernières réponses du salon. Un `id` renvoyé reçoit la **même** réponse (`ACK` ou `ERROR` avec le même code), sans que l'action soit rejouée. `JOIN` et `SYNC` en sont exclus : ils renvoient toujours l'état à jour.
+
 **Persistance du salon (SRV-07) :** l'état du salon (salle d'attente, partie, `seq`) est enregistré dans le stockage du RoomDO **avant** l'envoi de tout message qui en découle (`ACK`, événements, `STATE`). Un redémarrage du RoomDO ne perd donc aucun coup qu'un joueur a vu : le nouvel exemplaire relit l'état, l'alarme reste armée, et les joueurs qui se reconnectent reçoivent la partie sauvegardée avec `JOIN` (ou `SYNC`).
 
 ---
@@ -265,7 +271,7 @@ Toutes exigent l'en-tête `Authorization: Bearer <jeton Supabase>`. Les opérati
 
 | Limite | Valeur | Dépassement |
 | ----- | ----- | ----- |
-| Messages par connexion | 20 par seconde | `ERROR RATE_LIMITED` ; à la 3ᵉ fois, fermeture 4008 |
+| Messages par connexion | 20 par seconde | `ERROR RATE_LIMITED` (le message n'est pas traité) ; à la 3ᵉ seconde où la limite est dépassée, fermeture 4008 |
 | Taille d'un message | 4 Ko | Fermeture 4008 |
 | `CALL_CHECK` par joueur | 1 par fenêtre d'oubli | `ERROR NO_CHECK_TO_CALL` |
 | Créations de salon | 10 par heure et par joueur | `ERROR RATE_LIMITED` |
@@ -347,6 +353,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.8 — 22/11/2026.** SRV-08 : reconnexion, connexion remplacée, identifiants déjà traités, limite de débit (§7, §8).
+>
 > **Version 1.7 — 20/11/2026.** SRV-07 : persistance du salon avant tout envoi (§7).
 >
 > **Version 1.6 — 20/11/2026.** SRV-06 : précisions sur le gestionnaire d'échéances (§9).

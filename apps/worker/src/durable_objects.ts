@@ -17,6 +17,7 @@ import {
 } from "@check/protocol";
 import { createJwksProvider, issuerFor, verifyAccessToken, type KeyProvider } from "./auth.js";
 import { loadServerConfig, type Env, type ServerConfig } from "./env.js";
+import { RATE_RULE, checkRate, type RateRule, type RateState } from "./rate_limit.js";
 
 /** Header set by the Worker for `/ws/user/{userId}` (never trusted from clients). */
 export const USER_ID_HEADER = "X-Check-User-Id";
@@ -24,7 +25,7 @@ export const USER_ID_HEADER = "X-Check-User-Id";
 /** State of a WebSocket, stored with `serializeAttachment` (survives hibernation). */
 export type Attachment =
   | { phase: "pending"; connectedAt: number; expectedUserId?: string }
-  | { phase: "authed"; userId: string; connectedAt: number };
+  | { phase: "authed"; userId: string; connectedAt: number; rate?: RateState };
 
 type MessageOf = {
   room: RoomClientMessage;
@@ -55,6 +56,8 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
   protected readonly config: ServerConfig;
   /** Server clock (ms). Public so that tests can simulate time; tokens use the real time. */
   clock: () => number = () => Date.now();
+  /** Message rate rule (protocole §8). Public so that fast simulated games can relax it. */
+  rateRule: RateRule = RATE_RULE;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -92,13 +95,33 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
   }
 
   override async webSocketMessage(ws: WebSocket, data: string | ArrayBuffer): Promise<void> {
-    const att = ws.deserializeAttachment() as Attachment;
+    let att = ws.deserializeAttachment() as Attachment;
     const raw = typeof data === "string" ? data : null;
     const parsed = raw === null ? null : parseClientMessage(this.kind, raw);
 
     if (parsed?.ok === false && parsed.close !== undefined) {
       ws.close(parsed.close, "TOO_MANY_MESSAGES");
       return;
+    }
+    if (att.phase === "authed") {
+      // §8 — 20 messages per second; the 3rd second over the limit closes the connection.
+      const decision = checkRate(att.rate, this.clock(), this.rateRule);
+      att = { ...att, rate: decision.state };
+      ws.serializeAttachment(att);
+      if (decision.close) {
+        ws.close(CLOSE_CODES.TOO_MANY_MESSAGES, "TOO_MANY_MESSAGES");
+        return;
+      }
+      if (!decision.allowed) {
+        const id = parsed?.ok === true && "id" in parsed.message ? parsed.message.id : undefined;
+        this.send(ws, {
+          t: "ERROR",
+          ...(id === undefined ? {} : { id }),
+          code: "RATE_LIMITED",
+          message: "Too many messages",
+        });
+        return;
+      }
     }
     if (att.phase === "pending") {
       // §2.1 — the first message must be AUTH.
@@ -132,8 +155,13 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
   }
 
   override async webSocketClose(ws: WebSocket): Promise<void> {
-    // Answer the client's close frame (codes such as 1005/1006 cannot be echoed).
-    ws.close();
+    // Answer the client's close frame (codes such as 1005/1006 cannot be echoed); the socket
+    // may already be closing when the server initiated the close (4003, 4004…).
+    try {
+      ws.close();
+    } catch {
+      // already closed
+    }
     const att = ws.deserializeAttachment() as Attachment | null;
     if (att?.phase === "authed") await this.onSocketClosed(att.userId);
   }
@@ -161,6 +189,18 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
 
   /** Called by the alarm; handles the subclass deadlines that are due at `now`. */
   protected onDeadline(_now: number): Promise<void> | void {
+    // Nothing by default.
+  }
+
+  /**
+   * Called after a successful AUTH (`first`: the first one of this connection, not a token
+   * refresh).
+   */
+  protected onAuthenticated(
+    _ws: WebSocket,
+    _userId: string,
+    _first: boolean,
+  ): Promise<void> | void {
     // Nothing by default.
   }
 
@@ -218,10 +258,12 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
       phase: "authed",
       userId: result.userId,
       connectedAt: att.connectedAt,
+      ...(att.phase === "authed" && att.rate !== undefined ? { rate: att.rate } : {}),
     };
     ws.serializeAttachment(authed);
     this.send(ws, { t: "AUTH_OK", userId: result.userId, serverTime: this.clock() });
     if (att.phase === "pending") await this.reschedule();
+    await this.onAuthenticated(ws, result.userId, att.phase === "pending");
   }
 }
 

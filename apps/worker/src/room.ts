@@ -11,6 +11,7 @@ import {
   applyTimeout,
   createGame,
   getPlayerView,
+  setConnected,
   type ActionResult,
   type EngineEvent,
   type GameOverEvent,
@@ -67,6 +68,11 @@ export type RoomState = {
   debited: string[];
   /** Rules engine state while PLAYING and after the end (for the last STATE). */
   game: GameState | null;
+  /**
+   * Replies already sent, by action id (most recent last): a repeated id gets the same reply
+   * without being processed again (protocole §3).
+   */
+  replies: { id: string; reply: "ACK" | ErrorCode }[];
   /** Start of the game (PLAYING); aborted after 2 h (protocole §9). */
   startedAt: number | null;
   /** End of the game; the room closes 60 s later (protocole §9). */
@@ -98,6 +104,8 @@ type RoomEvent =
 type GameMessage = Extract<ActionMessage<"room">, { t: "PLAY" | "DRAW" | "CALL_CHECK" }>;
 
 const STORAGE_KEY = "room";
+/** Number of action ids remembered for duplicate detection. */
+const REPLIES_KEPT = 200;
 /** Room timers (protocole §9), from the game constants. */
 const TIMERS: DeadlineTimers = {
   roomTtlMs: GAME_CONFIG.timers.room_ttl_seconds * 1000,
@@ -153,6 +161,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       pot: 0,
       debited: [],
       game: null,
+      replies: [],
       startedAt: null,
       finishedAt: null,
     };
@@ -188,6 +197,15 @@ export class RoomDO extends ProtocolObject<"room"> {
     userId: string,
     message: ActionMessage<"room">,
   ): Promise<void> {
+    if (message.t !== "JOIN" && message.t !== "SYNC") {
+      const previous = this.room().replies.find((r) => r.id === message.id);
+      if (previous !== undefined) {
+        // Already processed (resent after a reconnection): same reply, nothing replayed.
+        if (previous.reply === "ACK") this.ack(ws, previous.id);
+        else this.error(ws, previous.id, previous.reply);
+        return;
+      }
+    }
     switch (message.t) {
       case "JOIN":
         return this.join(ws, userId, message.id);
@@ -265,6 +283,48 @@ export class RoomDO extends ProtocolObject<"room"> {
       startedAt: room.startedAt,
       finishedAt: room.finishedAt,
     };
+  }
+
+  // ---------- Connections (protocole §7) ----------
+
+  /**
+   * After AUTH: an older connection of the same player is closed (4003), and a seated player
+   * gets the STATE directly (§7.3); in a game, the engine learns that the player is back.
+   */
+  protected override async onAuthenticated(
+    ws: WebSocket,
+    userId: string,
+    first: boolean,
+  ): Promise<void> {
+    if (!first || this.state === null) return;
+    const older = this.sockets(userId).filter((socket) => socket !== ws);
+    for (const socket of older) socket.close(CLOSE_CODES.REPLACED, "REPLACED");
+    if (!this.isPlayer(userId)) return;
+    const room = this.room();
+    if (room.status === "PLAYING" && room.game !== null) {
+      this.absorbGameResult(setConnected(room.game, userId, true, this.clock()));
+    } else if ((room.status === "WAITING" || room.status === "COUNTDOWN") && older.length === 0) {
+      this.broadcast({ t: "PLAYER_CONNECTION", playerId: userId, connected: true }, userId);
+    }
+    this.queue(ws, { t: "STATE", view: this.viewFor(userId) });
+    await this.commit();
+    await this.reschedule();
+  }
+
+  /** The last connection of a seated player closed: the others are told (and the engine). */
+  protected override async onSocketClosed(userId: string): Promise<void> {
+    if (this.state === null || !this.isPlayer(userId) || this.sockets(userId).length > 0) return;
+    const room = this.room();
+    if (room.status === "PLAYING" && room.game !== null) {
+      // Disconnected during the turn: 60 s in total (cahier §9).
+      this.absorbGameResult(setConnected(room.game, userId, false, this.clock()));
+    } else if (room.status === "WAITING" || room.status === "COUNTDOWN") {
+      this.broadcast({ t: "PLAYER_CONNECTION", playerId: userId, connected: false });
+    } else {
+      return;
+    }
+    await this.commit();
+    await this.reschedule();
   }
 
   // ---------- Waiting room (protocole §4.1, cahier §2.1) ----------
@@ -541,6 +601,14 @@ export class RoomDO extends ProtocolObject<"room"> {
   /** Stores the new engine state and sends its events (private ones to their recipient). */
   private async applyGameResult(result: ActionResult): Promise<void> {
     if (result.events.length === 0) return;
+    const over = this.absorbGameResult(result);
+    if (over !== null) await this.finishGame(over);
+    await this.commit();
+    await this.reschedule();
+  }
+
+  /** Stores the engine state and queues its events; returns GAME_OVER if the game ended. */
+  private absorbGameResult(result: ActionResult): GameOverEvent | null {
     const room = this.room();
     room.game = result.state;
     let over: GameOverEvent | null = null;
@@ -555,9 +623,7 @@ export class RoomDO extends ProtocolObject<"room"> {
         this.broadcast(event);
       }
     }
-    if (over !== null) await this.finishGame(over);
-    await this.commit();
-    await this.reschedule();
+    return over;
   }
 
   /**
@@ -709,11 +775,19 @@ export class RoomDO extends ProtocolObject<"room"> {
   }
 
   private ack(ws: WebSocket, id: string): void {
+    this.remember(id, "ACK");
     this.queue(ws, { t: "ACK", id });
   }
 
   private error(ws: WebSocket, id: string, code: ErrorCode): void {
+    this.remember(id, code);
     this.queue(ws, { t: "ERROR", id, code, message: code });
+  }
+
+  private remember(id: string, reply: "ACK" | ErrorCode): void {
+    const replies = this.room().replies.filter((r) => r.id !== id);
+    replies.push({ id, reply });
+    this.room().replies = replies.slice(-REPLIES_KEPT);
   }
 
   /** Queues a message; it is sent by the next `commit`. */

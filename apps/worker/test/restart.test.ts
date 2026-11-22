@@ -72,6 +72,7 @@ describe("SRV-07 — sauvegarde après chaque coup et reprise après redémarrag
     const roomId = await createRoom({ hostId });
     await runInDurableObject(stub(roomId), (instance: RoomDO) => {
       instance.rng = createSeededRng(21);
+      instance.rateRule = { limit: 10_000, windowMs: 1000, maxStrikes: 3 }; // simulated play is fast
     });
     let a = await connectPlayer(roomId, hostId);
     let b = await connectPlayer(roomId, otherId);
@@ -89,6 +90,10 @@ describe("SRV-07 — sauvegarde après chaque coup et reprise après redémarrag
 
     await restart(roomId);
     expect(await instanceMarker(roomId)).toBeUndefined(); // a new instance was created
+    await runInDurableObject(stub(roomId), (instance: RoomDO) => {
+      // The new instance starts with the normal rate rule; simulated play is fast.
+      instance.rateRule = { limit: 10_000, windowMs: 1000, maxStrikes: 3 };
+    });
     const after = await state(roomId);
     expect(after).toEqual(before);
     expect(after.game?.currentPlayerId).not.toBe(first.game?.currentPlayerId);
