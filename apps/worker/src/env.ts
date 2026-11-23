@@ -1,6 +1,7 @@
 // Bindings of the Worker (wrangler.jsonc) and server configuration read from them.
 
 import type { LobbyDO } from "./lobby.js";
+import type { LogLevel } from "./log.js";
 import type { UserDO } from "./user.js";
 import type { RoomDO } from "./room.js";
 
@@ -14,12 +15,17 @@ export type Env = {
   SUPABASE_JWKS?: string;
   /** AUTH deadline in ms (default 5000, protocole §2.1); shortened in tests. */
   AUTH_TIMEOUT_MS?: string;
+  /** Minimum log level: debug, info (default), warn or error. */
+  LOG_LEVEL?: string;
 };
 
 export type ServerConfig = {
   supabaseUrl: string;
   authTimeoutMs: number;
+  logLevel: LogLevel;
 };
+
+const LOG_LEVELS: readonly LogLevel[] = ["debug", "info", "warn", "error"];
 
 /** Default AUTH deadline (protocole §2.1). */
 export const AUTH_TIMEOUT_MS = 5000;
@@ -33,5 +39,7 @@ export function loadServerConfig(env: Env): ServerConfig {
   if (!Number.isInteger(timeout) || timeout <= 0) {
     throw new Error("Invalid configuration: AUTH_TIMEOUT_MS");
   }
-  return { supabaseUrl: env.SUPABASE_URL, authTimeoutMs: timeout };
+  const logLevel = (env.LOG_LEVEL ?? "info") as LogLevel;
+  if (!LOG_LEVELS.includes(logLevel)) throw new Error("Invalid configuration: LOG_LEVEL");
+  return { supabaseUrl: env.SUPABASE_URL, authTimeoutMs: timeout, logLevel };
 }

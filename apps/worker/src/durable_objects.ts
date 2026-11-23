@@ -17,6 +17,7 @@ import {
 } from "@check/protocol";
 import { createJwksProvider, issuerFor, verifyAccessToken, type KeyProvider } from "./auth.js";
 import { loadServerConfig, type Env, type ServerConfig } from "./env.js";
+import { consoleSink, logEntry, shouldLog, type LogLevel, type LogSink } from "./log.js";
 import { RATE_RULE, checkRate, type RateRule, type RateState } from "./rate_limit.js";
 
 /** Header set by the Worker for `/ws/user/{userId}` (never trusted from clients). */
@@ -56,6 +57,8 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
   protected readonly config: ServerConfig;
   /** Server clock (ms). Public so that tests can simulate time; tokens use the real time. */
   clock: () => number = () => Date.now();
+  /** Where structured logs go. Public so that tests can collect them. */
+  logSink: LogSink = consoleSink;
   /** Message rate rule (protocole §8). Public so that fast simulated games can relax it. */
   rateRule: RateRule = RATE_RULE;
 
@@ -87,6 +90,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     for (const ws of this.ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
       if (att?.phase === "pending" && att.connectedAt + this.config.authTimeoutMs <= now) {
+        this.log("warn", "auth_timeout");
         ws.close(CLOSE_CODES.UNAUTHORIZED, "UNAUTHORIZED");
       }
     }
@@ -100,6 +104,9 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     const parsed = raw === null ? null : parseClientMessage(this.kind, raw);
 
     if (parsed?.ok === false && parsed.close !== undefined) {
+      this.log("warn", "message_too_large", {
+        userId: att.phase === "authed" ? att.userId : undefined,
+      });
       ws.close(parsed.close, "TOO_MANY_MESSAGES");
       return;
     }
@@ -109,8 +116,15 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
       att = { ...att, rate: decision.state };
       ws.serializeAttachment(att);
       if (decision.close) {
+        this.log("warn", "rate_limit_close", {
+          userId: att.userId,
+          strikes: decision.state.strikes,
+        });
         ws.close(CLOSE_CODES.TOO_MANY_MESSAGES, "TOO_MANY_MESSAGES");
         return;
+      }
+      if (!decision.allowed && decision.state.count === this.rateRule.limit + 1) {
+        this.log("warn", "rate_limited", { userId: att.userId, strikes: decision.state.strikes });
       }
       if (!decision.allowed) {
         const id = parsed?.ok === true && "id" in parsed.message ? parsed.message.id : undefined;
@@ -126,6 +140,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     if (att.phase === "pending") {
       // §2.1 — the first message must be AUTH.
       if (parsed?.ok !== true || parsed.message.t !== "AUTH") {
+        this.log("warn", "auth_missing");
         ws.close(CLOSE_CODES.UNAUTHORIZED, "UNAUTHORIZED");
         return;
       }
@@ -149,12 +164,15 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
       await this.authenticate(ws, att, message);
     } else if (message.t === "PING") {
       this.send(ws, { t: "PONG", c: message.c, s: this.clock() });
+      // Network latency measured by the app (protocole §10), sent with the next PING.
+      if (message.rtt !== undefined)
+        this.log("info", "ping", { userId: att.userId, rtt: message.rtt });
     } else {
       await this.onMessage(ws, att.userId, message as ActionMessage<K>);
     }
   }
 
-  override async webSocketClose(ws: WebSocket): Promise<void> {
+  override async webSocketClose(ws: WebSocket, code?: number): Promise<void> {
     // Answer the client's close frame (codes such as 1005/1006 cannot be echoed); the socket
     // may already be closing when the server initiated the close (4003, 4004…).
     try {
@@ -163,6 +181,10 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
       // already closed
     }
     const att = ws.deserializeAttachment() as Attachment | null;
+    this.log("info", "ws_closed", {
+      userId: att?.phase === "authed" ? att.userId : undefined,
+      code,
+    });
     if (att?.phase === "authed") await this.onSocketClosed(att.userId);
   }
 
@@ -209,7 +231,22 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     // Nothing by default.
   }
 
+  /** Context added to every log entry (the room adds its room and game). */
+  protected logFields(): Record<string, unknown> {
+    return { object: this.kind, objectId: this.ctx.id.toString() };
+  }
+
   // ---------- Helpers ----------
+
+  /** Writes a structured log entry with the object's context. */
+  protected log(level: LogLevel, msg: string, fields: Record<string, unknown> = {}): void {
+    if (this.logSink === consoleSink && !shouldLog(level, this.config.logLevel)) return;
+    try {
+      this.logSink(logEntry(level, msg, { ...this.logFields(), ...fields }, Date.now()));
+    } catch {
+      // Logging must never break the game.
+    }
+  }
 
   protected send(ws: WebSocket, message: unknown): void {
     if (ws.readyState === OPEN) ws.send(JSON.stringify(message));
@@ -240,6 +277,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
   /** First AUTH, or a later AUTH with a refreshed token (§2.1, step 5). */
   private async authenticate(ws: WebSocket, att: Attachment, message: AuthMessage): Promise<void> {
     if (message.v !== PROTOCOL_VERSION) {
+      this.log("warn", "upgrade_required", { v: message.v });
       ws.close(CLOSE_CODES.UPGRADE_REQUIRED, "UPGRADE_REQUIRED");
       return;
     }
@@ -251,6 +289,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     );
     const expected = att.phase === "pending" ? att.expectedUserId : att.userId;
     if (!result.ok || (expected !== undefined && result.userId !== expected)) {
+      this.log("warn", "auth_failed", { reason: result.ok ? "user_mismatch" : result.reason });
       ws.close(CLOSE_CODES.UNAUTHORIZED, "UNAUTHORIZED");
       return;
     }
@@ -263,6 +302,7 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     ws.serializeAttachment(authed);
     this.send(ws, { t: "AUTH_OK", userId: result.userId, serverTime: this.clock() });
     if (att.phase === "pending") await this.reschedule();
+    this.log("info", "auth_ok", { userId: result.userId, first: att.phase === "pending" });
     await this.onAuthenticated(ws, result.userId, att.phase === "pending");
   }
 }

@@ -157,7 +157,7 @@ Variables d'environnement du Worker : `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`
 
 ## 7. Observabilité
 
-* **Journaux** : Workers Logs (Cloudflare) ; chaque message porte `roomId`, `gameId`, `userId`.
+* **Journaux** : Workers Logs (Cloudflare) ; une ligne JSON par événement (`ts`, `level`, `msg`), avec le contexte `object`, `objectId`, `roomId`, `gameId`, `userId` quand ils existent. Événements : connexion (`auth_ok`, `auth_failed`, `auth_timeout`, `upgrade_required`, `ws_closed`, `connection_replaced`), limites (`rate_limited`, `rate_limit_close`, `message_too_large`), chaque action (`action` : type, réponse `ACK` ou code d'erreur, `durationMs` de traitement), latence des joueurs (`ping` avec `rtt`), partie (`game_started`, `deadline`, `game_over` avec les montants, `room_closed`) et erreurs (`settlement_failed`, `release_failed`, `lobby_update_failed`). Jamais de jeton, de pseudo ni d'email. Niveau minimum : variable `LOG_LEVEL` (`info` par défaut).
 * **Métriques suivies** : latence `PING`/`PONG` par pays, durée des parties, taux d'erreurs par code, taux de reconnexion, appels Supabase échoués.
 * **Alertes** : échec de `settle_game` après les 5 tentatives ; solde d'un portefeuille `GAME:*` non nul plus de 10 min après la fin ; somme globale des portefeuilles ≠ 0 (contrôle quotidien).
 * **Erreurs du navigateur** : remontées vers `/api/client-errors` (limité à 10 par minute et par joueur).

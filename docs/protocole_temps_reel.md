@@ -185,7 +185,7 @@ type PlayerView = {
 | `DRAW` | `id` | Son tour (sans pénalité : 1 carte ; avec pénalité : toute la pénalité) | `NOT_YOUR_TURN` |
 | `CALL_CHECK` | `id`, `targetId` | Pendant la fenêtre d'oubli (règles §8) | `NO_CHECK_TO_CALL` |
 | `SYNC` | `id` | Trou dans `seq`, retour au premier plan, doute | — |
-| `PING` | `c` (horodatage client) | Toutes les **15 s** | — |
+| `PING` | `c` (horodatage client), `rtt?` (dernière latence mesurée par l'app, ms, §10) | Toutes les **15 s** | — |
 
 ### 6.2 Serveur → client (connexion salon)
 
@@ -319,6 +319,7 @@ Le gestionnaire d'alarme est **idempotent** : il relit l'heure et l'état, et ne
 * Chaque `PONG` donne `s` (heure serveur). Le client calcule `rtt = maintenant − c` et `décalage = s + rtt/2 − maintenant`. Il garde la **médiane des 5 dernières mesures**.
 * Temps restant affiché = `turnDeadline − (maintenant + décalage)`.
 * La latence mesurée (`rtt`) est affichée discrètement (icône de signal : vert < 150 ms, orange < 400 ms, rouge au-delà).
+* L'app joint la dernière latence mesurée au `PING` suivant (champ `rtt`, facultatif) : le serveur l'écrit dans ses journaux (architecture §8), ce qui rend la latence réelle des joueurs visible côté serveur.
 
 ---
 
@@ -366,6 +367,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.11 — 23/11/2026.** SRV-11 : champ `rtt` facultatif du `PING` (§6.1, §10).
+>
 > **Version 1.10 — 23/11/2026.** SRV-10 : liste des salons publics et partie rapide (§6.4).
 >
 > **Version 1.9 — 22/11/2026.** SRV-09 : salon actuel et réservation du joueur (§6.3).

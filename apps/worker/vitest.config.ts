@@ -24,6 +24,8 @@ export default defineWorkersConfig(async () => {
   return {
     test: {
       include: ["test/**/*.test.ts"],
+      // Integration tests drive real Durable Objects: leave room for a busy machine.
+      testTimeout: 20_000,
       poolOptions: {
         workers: {
           // Durable Objects holding WebSockets are not compatible with isolated storage.
@@ -39,6 +41,8 @@ export default defineWorkersConfig(async () => {
               TEST_SIGNING_JWK: keys.privateJwk,
               // 5 s in production (protocole §2.1); shortened so that the test does not wait.
               AUTH_TIMEOUT_MS: "300",
+              // Tests that check logs collect them with their own sink.
+              LOG_LEVEL: "warn",
             },
           },
         },

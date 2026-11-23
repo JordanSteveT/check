@@ -136,6 +136,8 @@ export class RoomDO extends ProtocolObject<"room"> {
   lobby: LobbyPublisher;
   /** Last entry published to the lobby (JSON), to publish only changes. */
   private lobbyPublished: string | null = null;
+  /** Lobby updates, chained so that they reach the lobby in order. */
+  private lobbySync: Promise<void> = Promise.resolve();
   /** Random generator of the game. Public so that tests can use a seeded one. */
   rng: Rng = cryptoRng;
   private state: RoomState | null = null;
@@ -144,6 +146,8 @@ export class RoomDO extends ProtocolObject<"room"> {
    * describes is durable, so a restart never loses a move that a player has seen (SRV-07).
    */
   private outbox: { ws: WebSocket; message: unknown }[] = [];
+  /** Reply to the action being handled, for its log line. */
+  private lastReply: "ACK" | ErrorCode | null = null;
   /** Players to free in their UserDO at the next commit. */
   private releases = new Set<string>();
   /** Players whose JOIN is in progress (claimed in their UserDO, not seated yet). */
@@ -195,6 +199,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     };
     await this.commit();
     await this.reschedule();
+    await this.lobbySync;
   }
 
   /** Whether the player still holds a seat here (asked by the UserDO before refusing a room). */
@@ -223,11 +228,33 @@ export class RoomDO extends ProtocolObject<"room"> {
     userId: string,
     message: ActionMessage<"room">,
   ): Promise<void> {
+    const started = Date.now();
+    this.lastReply = null;
     try {
       await this.handleMessage(ws, userId, message);
     } finally {
       await this.commit();
+      this.log("info", "action", {
+        userId,
+        t: message.t,
+        id: message.id,
+        reply: this.replyForLog(),
+        durationMs: Date.now() - started,
+      });
     }
+  }
+
+  /** Reply set by ack() / error() while the action was handled. */
+  private replyForLog(): "ACK" | ErrorCode | undefined {
+    return this.lastReply ?? undefined;
+  }
+
+  protected override logFields(): Record<string, unknown> {
+    return {
+      ...super.logFields(),
+      roomId: this.ctx.id.toString(),
+      gameId: this.state?.gameId ?? undefined,
+    };
   }
 
   private async handleMessage(
@@ -281,6 +308,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       if (room === null) return;
       const due = dueDeadlines(this.deadlineInput(room), TIMERS, now)[0];
       if (due === undefined) return;
+      this.log("info", "deadline", { kind: due.kind, lateMs: now - due.at });
       const before = JSON.stringify(room);
       await this.handleDeadline(due, now);
       await this.commit();
@@ -337,6 +365,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     if (!first || this.state === null) return;
     const older = this.sockets(userId).filter((socket) => socket !== ws);
     for (const socket of older) socket.close(CLOSE_CODES.REPLACED, "REPLACED");
+    if (older.length > 0) this.log("info", "connection_replaced", { userId });
     if (!this.isPlayer(userId)) return;
     const room = this.room();
     if (room.status === "PLAYING" && room.game !== null) {
@@ -596,6 +625,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     );
     room.status = "PLAYING";
     room.startedAt = now;
+    this.log("info", "game_started", { gameId, players: debited.length, fee: room.fee });
     room.debited = debited;
     room.pot = room.fee * debited.length;
     room.game = game;
@@ -708,6 +738,12 @@ export class RoomDO extends ProtocolObject<"room"> {
     room.finishedAt = this.clock();
     for (const player of room.players) this.releases.add(player.id);
     this.broadcast({ ...event, ...settlement });
+    this.log("info", "game_over", {
+      result: event.result,
+      reason: event.reason,
+      winnerId: event.winnerId ?? undefined,
+      ...settlement,
+    });
     await this.commit();
     const gameId = room.gameId ?? "";
     try {
@@ -723,13 +759,14 @@ export class RoomDO extends ProtocolObject<"room"> {
       }
     } catch (err) {
       // Retries and alerts: ECO-04.
-      console.error(JSON.stringify({ msg: "settlement failed", gameId, error: String(err) }));
+      this.log("error", "settlement_failed", { error: String(err) });
     }
   }
 
   /** §2.1.4 — the room is destroyed: every connection is closed with 4004. */
   private async closeRoom(): Promise<void> {
     this.room().status = "CLOSED";
+    this.log("info", "room_closed");
     for (const player of this.room().players) this.releases.add(player.id);
     await this.commit();
     for (const ws of this.ctx.getWebSockets()) ws.close(CLOSE_CODES.ROOM_CLOSED, "ROOM_CLOSED");
@@ -843,6 +880,7 @@ export class RoomDO extends ProtocolObject<"room"> {
   }
 
   private remember(id: string, reply: "ACK" | ErrorCode): void {
+    this.lastReply = reply;
     const replies = this.room().replies.filter((r) => r.id !== id);
     replies.push({ id, reply });
     this.room().replies = replies.slice(-REPLIES_KEPT);
@@ -865,12 +903,12 @@ export class RoomDO extends ProtocolObject<"room"> {
       } catch (err) {
         // The UserDO checks with the room before refusing a claim, so a missed release
         // cannot lock the player out.
-        console.error(
-          JSON.stringify({ msg: "release failed", roomId, userId, error: String(err) }),
-        );
+        this.log("error", "release_failed", { userId, error: String(err) });
       }
     }
-    await this.syncLobby();
+    // The lobby list is updated after the move, in order, without delaying it.
+    this.lobbySync = this.lobbySync.then(() => this.syncLobby());
+    this.ctx.waitUntil(this.lobbySync);
   }
 
   /**
@@ -901,7 +939,7 @@ export class RoomDO extends ProtocolObject<"room"> {
       else await this.lobby.upsert(entry);
       this.lobbyPublished = key;
     } catch (err) {
-      console.error(JSON.stringify({ msg: "lobby update failed", roomId, error: String(err) }));
+      this.log("error", "lobby_update_failed", { error: String(err) });
     }
   }
 }

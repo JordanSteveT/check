@@ -15,7 +15,12 @@ export const AuthMessageSchema = z.strictObject({
   token: z.string().min(1),
   v: z.number().int(),
 });
-export const PingMessageSchema = z.strictObject({ t: z.literal("PING"), c: TimestampSchema });
+export const PingMessageSchema = z.strictObject({
+  t: z.literal("PING"),
+  c: TimestampSchema,
+  /** Last round-trip time measured by the app (§10), in ms; logged by the server. */
+  rtt: z.number().int().nonnegative().max(60_000).optional(),
+});
 
 const action = <T extends string>(t: T) => ({ t: z.literal(t), id: ActionIdSchema });
 

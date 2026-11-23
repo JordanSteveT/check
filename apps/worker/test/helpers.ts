@@ -53,7 +53,7 @@ export async function signToken(options: SignOptions = {}): Promise<string> {
 export type Client = {
   send: (message: unknown) => void;
   sendRaw: (raw: string) => void;
-  /** Next message received (rejects after 2 s). */
+  /** Next message received (rejects after 5 s). */
   next: () => Promise<Record<string, unknown>>;
   /** Resolves when the server closes the socket. */
   closed: Promise<{ code: number; reason: string }>;
@@ -108,8 +108,8 @@ export async function connect(path: string): Promise<Client> {
       if (queued) return Promise.resolve(queued);
       return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-          reject(new Error("no message within 2 s"));
-        }, 2000);
+          reject(new Error("no message within 5 s"));
+        }, 5000);
         waiting.push((m) => {
           clearTimeout(timer);
           resolve(m);

@@ -79,8 +79,10 @@ export class LobbyDO extends ProtocolObject<"lobby"> {
   ): Promise<void> {
     // The only lobby action: QUICK_PLAY.
     const { id, fee } = message;
+    const started = Date.now();
     if (!isValidFee(fee, DEFAULT_FEE_RULE)) {
       this.reply(ws, id, "INVALID_FEE");
+      this.log("info", "action", { userId, t: message.t, id, reply: "INVALID_FEE", fee });
       return;
     }
     const roomId =
@@ -88,6 +90,15 @@ export class LobbyDO extends ProtocolObject<"lobby"> {
       (await this.createQuickPlayRoom(fee, userId));
     this.send(ws, { t: "ACK", id });
     this.send(ws, { t: "QUICK_PLAY_MATCHED", roomId });
+    this.log("info", "action", {
+      userId,
+      t: message.t,
+      id,
+      reply: "ACK",
+      fee,
+      roomId,
+      durationMs: Date.now() - started,
+    });
   }
 
   // ---------- Helpers ----------
