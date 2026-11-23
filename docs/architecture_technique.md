@@ -104,7 +104,7 @@ Ce document fixe **comment** le jeu est construit. Les règles du jeu sont dans 
 
 1. L'app se connecte avec Supabase Auth (Google, email ou invité), Turnstile à l'appui.
 2. Elle appelle la fonction SQL `sync_account(pseudo, device_id)` : création du profil, du portefeuille, attribution des bonus selon les règles (spécification des jetons §9).
-3. Elle ouvre le WebSocket `/ws/user` (UserDO) : présence et salon en cours.
+3. Elle ouvre le WebSocket `/ws/user/{userId}` (UserDO) : présence et salon en cours.
 4. Elle s'abonne en Realtime à **sa** ligne de la table `wallets` pour afficher le solde en direct.
 
 ### 4.2 Créer et rejoindre un salon
@@ -151,13 +151,13 @@ Ce document fixe **comment** le jeu est construit. Les règles du jeu sont dans 
 | **Préproduction** | Worker `check-staging`, sous-domaine `staging.` | Projet Supabase `check-staging` (Paris) | Tests, bêta fermée, mesures de latence |
 | **Production** | Worker `check`, domaine principal | Projet Supabase `check-prod` (Paris), offre **Pro** | Joueurs |
 
-Variables d'environnement du Worker : `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` (secret), `SUPABASE_JWKS_URL`, `TURNSTILE_SITE_KEY`, `ENV` (`local`/`staging`/`production`).
+Variables d'environnement du Worker : `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`, `SUPABASE_SECRET_KEY` (secret), `TURNSTILE_SITE_KEY`, `ENV` (`local`/`staging`/`production`). Le JWKS est lu à `{SUPABASE_URL}/auth/v1/.well-known/jwks.json` ; l'émetteur attendu des jetons est `{SUPABASE_URL}/auth/v1` et l'audience `authenticated`. Réservées aux tests et au local : `SUPABASE_JWKS` (JWKS en ligne, remplace la lecture réseau) et `AUTH_TIMEOUT_MS` (délai d'`AUTH`, 5 000 ms par défaut). Le projet Supabase doit signer ses jetons avec des **clés asymétriques** (ES256 ou RS256) : les jetons HS256 (ancien secret partagé) sont refusés.
 
 ---
 
 ## 7. Observabilité
 
-* **Journaux** : Workers Logs (Cloudflare) ; chaque message porte `roomId`, `gameId`, `userId`.
+* **Journaux** : Workers Logs (Cloudflare) ; une ligne JSON par événement (`ts`, `level`, `msg`), avec le contexte `object`, `objectId`, `roomId`, `gameId`, `userId` quand ils existent. Événements : connexion (`auth_ok`, `auth_failed`, `auth_timeout`, `upgrade_required`, `ws_closed`, `connection_replaced`), limites (`rate_limited`, `rate_limit_close`, `message_too_large`), chaque action (`action` : type, réponse `ACK` ou code d'erreur, `durationMs` de traitement), latence des joueurs (`ping` avec `rtt`), partie (`game_started`, `deadline`, `game_over` avec les montants, `room_closed`) et erreurs (`settlement_failed`, `release_failed`, `lobby_update_failed`). Jamais de jeton, de pseudo ni d'email. Niveau minimum : variable `LOG_LEVEL` (`info` par défaut).
 * **Métriques suivies** : latence `PING`/`PONG` par pays, durée des parties, taux d'erreurs par code, taux de reconnexion, appels Supabase échoués.
 * **Alertes** : échec de `settle_game` après les 5 tentatives ; solde d'un portefeuille `GAME:*` non nul plus de 10 min après la fin ; somme globale des portefeuilles ≠ 0 (contrôle quotidien).
 * **Erreurs du navigateur** : remontées vers `/api/client-errors` (limité à 10 par minute et par joueur).
@@ -168,7 +168,7 @@ Variables d'environnement du Worker : `SUPABASE_URL`, `SUPABASE_PUBLISHABLE_KEY`
 
 | Service | Offre | Coût indicatif |
 | ----- | ----- | ----- |
-| Cloudflare Workers + Durable Objects | **Workers Paid** (l'offre gratuite coupe le service quand le quota quotidien est atteint, en pleine partie) | 5 $ / mois + consommation |
+| Cloudflare Workers + Durable Objects | **Workers Paid** en production (l'offre gratuite coupe le service quand le quota quotidien est atteint, en pleine partie). Le développement local (`wrangler dev`) ne demande aucun compte, et l'offre gratuite suffit pour la préproduction : les Durable Objects sont déclarés avec le stockage SQLite (`new_sqlite_classes`), disponible sur les deux offres | 5 $ / mois + consommation |
 | Supabase | **Pro** pour la production (l'offre gratuite met le projet en pause après 7 jours d'inactivité) ; offre gratuite possible pour la préproduction | 25 $ / mois + consommation |
 | SMTP | Offre d'entrée d'un fournisseur d'emails transactionnels | 0 à 20 $ / mois |
 | Nom de domaine | — | ~10 à 15 $ / an |

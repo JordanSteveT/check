@@ -26,9 +26,13 @@ Les 54 identifiants sont uniques : ils servent directement d'identifiants de car
 
 | Connexion | URL | Durée de vie |
 | ----- | ----- | ----- |
-| Joueur (présence) | `wss://{domaine}/ws/user` | Toute la session dans l'app |
+| Joueur (présence) | `wss://{domaine}/ws/user/{userId}` | Toute la session dans l'app |
 | Salon | `wss://{domaine}/ws/room/{roomId}` | De l'entrée dans le salon à la fin de la partie |
 | Liste des salons publics | `wss://{domaine}/ws/lobby` | Seulement sur l'écran « Salons publics » |
+
+* `roomId` est l'identifiant du RoomDO créé par `newUniqueId()` (64 caractères hexadécimaux, impossible à deviner). Un identifiant mal formé ou non émis par le serveur reçoit une réponse HTTP **404** avant toute ouverture du WebSocket.
+* `userId` est l'identifiant Supabase du joueur (UUID). Il figure dans l'URL parce que le Worker doit choisir le UserDO **avant** de recevoir `AUTH` ; le UserDO ferme la connexion (4001) si le `sub` du jeton ne correspond pas à `userId`.
+* Une URL `/ws/…` sans en-tête `Upgrade: websocket` reçoit **426**.
 
 ### 2.1 Authentification (toutes les connexions)
 
@@ -59,7 +63,8 @@ Les 54 identifiants sont uniques : ils servent directement d'identifiants de car
 * Encodage **JSON**, texte UTF-8, **4 Ko maximum** par message.
 * Champ `t` : type du message.
 * **Client → serveur** : chaque action porte un identifiant `id` (UUID v4 généré par le client). Le serveur répond par `ACK` ou `ERROR` avec le même `id`. Un `id` déjà traité est ignoré (renvoi après reconnexion sans risque).
-* **Serveur → client** : chaque événement de salon porte `seq`, numéro croissant propre au salon, commençant à 1. Un client qui constate un trou dans `seq` envoie `SYNC`.
+* **Serveur → client** : chaque événement de salon **diffusé à tous** porte `seq`, numéro croissant propre au salon, commençant à 1. Les messages privés (`AUTH_OK`, `ACK`, `ERROR`, `STATE`, `PONG`, `HAND`, `YOU_DREW`) n'ont pas de `seq`, pour ne pas créer de trou chez les autres joueurs. Un client qui constate un trou dans `seq` envoie `SYNC`.
+* **Message invalide** (JSON illisible, type inconnu, champ manquant ou en trop) : `ERROR` avec le code `INVALID_MESSAGE`, et l'`id` du message s'il est lisible. Si seules les options sont invalides : `INVALID_OPTIONS` ; si seul le montant l'est : `INVALID_FEE`. Les règles métier du montant (200 à 10 000, paliers de 100) sont vérifiées par le serveur, pas par le schéma.
 * Horodatages : millisecondes depuis l'époque Unix (UTC), horloge du serveur.
 
 ```json
@@ -106,6 +111,16 @@ Les 54 identifiants sont uniques : ils servent directement d'identifiants de car
 | `PLAYING` | `PLAY`, `DRAW`, `CALL_CHECK`, `LEAVE` (= abandon), `SYNC` | `FINISHED` |
 | `FINISHED` | `SYNC`, `LEAVE` | `CLOSED` après 60 s |
 | `CLOSED` | Aucune | Les connexions sont fermées avec le code 4004 |
+
+**Précisions (SRV-04) :**
+
+* Un salon qui n'a pas été créé par `POST /api/rooms` (ou qui est `CLOSED`) ferme toute nouvelle connexion avec le code **4004**.
+* Le rôle d'hôte passe au joueur arrivé le plus tôt quand l'hôte quitte le salon, **privé ou public** (règles §2.1.5 ; dans un salon public, l'hôte sert seulement à `UPDATE_OPTIONS`).
+* `START` dans un salon public : `ERROR NOT_HOST` (pas de lancement manuel). `UPDATE_OPTIONS` hors de `WAITING` : `ROOM_LOCKED` (`ROOM_STARTING` pendant `STARTING`). Une action de jeu (`PLAY`, `DRAW`, `CALL_CHECK`) hors de `PLAYING` : `NOT_YOUR_TURN`.
+* Un joueur dont la connexion se coupe en salle d'attente **reste assis** (affiché déconnecté) ; il quitte le salon seulement avec `LEAVE`.
+* Durée de vie : 300 s après la création, un salon `WAITING` de moins de 2 joueurs est fermé ; passé ce délai, il est fermé dès qu'il redescend sous 2 joueurs en `WAITING`.
+* `STARTING` → `WAITING` (moins de 2 joueurs débités) : chaque joueur restant reçoit un `STATE` à jour (aucun événement dédié).
+* L'arrivée de chaque joueur est un événement numéroté (`PLAYER_JOINED`), même s'il est seul : le `STATE` reçu après `JOIN` porte le `seq` de son propre `PLAYER_JOINED`, qui ne lui est pas renvoyé.
 
 ### 4.2 Partie (état du moteur)
 
@@ -170,7 +185,7 @@ type PlayerView = {
 | `DRAW` | `id` | Son tour (sans pénalité : 1 carte ; avec pénalité : toute la pénalité) | `NOT_YOUR_TURN` |
 | `CALL_CHECK` | `id`, `targetId` | Pendant la fenêtre d'oubli (règles §8) | `NO_CHECK_TO_CALL` |
 | `SYNC` | `id` | Trou dans `seq`, retour au premier plan, doute | — |
-| `PING` | `c` (horodatage client) | Toutes les **15 s** | — |
+| `PING` | `c` (horodatage client), `rtt?` (dernière latence mesurée par l'app, ms, §10) | Toutes les **15 s** | — |
 
 ### 6.2 Serveur → client (connexion salon)
 
@@ -200,13 +215,20 @@ Les événements marqués « privé » ne sont envoyés qu'au joueur concerné.
 | `PLAYER_FORFEIT` | `playerId`, `reason` (`LEFT`, `TIMEOUTS`, `DISCONNECTED`), `nextPlayerId`, `turnDeadline` (`null` si la partie est finie) | Tous |
 | `GAME_OVER` | `result` (`WIN`, `DRAW`, `ABORTED`), `winnerId`, `reason` (`EMPTY_HAND`, `LAST_PLAYER`, `BLOCKED`, `TECHNICAL`), `pot`, `commission`, `payout`, `hands` (mains restantes révélées) | Tous |
 
-### 6.3 Connexion joueur (`/ws/user`)
+### 6.3 Connexion joueur (`/ws/user/{userId}`)
 
 | Sens | Message | Rôle |
 | ----- | ----- | ----- |
 | C → S | `AUTH`, `PING` | Comme ci-dessus |
 | S → C | `CURRENT_ROOM` `{ roomId \| null }` | À la connexion : permet de revenir dans une partie en cours après un rechargement |
 | S → C | `GUEST_EXPIRING` `{ secondsLeft }` | Invité reconnecté pendant le délai de 5 min |
+
+**Précisions (SRV-09) :**
+
+* `CURRENT_ROOM` est envoyé à la connexion **et à chaque changement** du salon du joueur (entrée, sortie, fin de partie).
+* Un joueur est réservé par un salon dès son `JOIN` (avant `check_can_join`) et libéré quand il quitte la salle d'attente, est retiré au lancement (`KICKED_BALANCE`), **abandonne ou est déclaré forfait**, à la fin de la partie ou à la fermeture du salon. Une entrée dans un autre salon pendant ce temps reçoit `ALREADY_IN_ROOM`.
+* Avant de refuser, le UserDO demande à l'ancien salon si le joueur y est encore assis : une réservation périmée (salon fermé, libération manquée) ne bloque jamais le joueur.
+* Plusieurs connexions `/ws/user` du même joueur (plusieurs onglets) sont acceptées : la règle 4003 ne concerne que les connexions salon.
 
 ### 6.4 Connexion liste (`/ws/lobby`)
 
@@ -218,6 +240,12 @@ Les événements marqués « privé » ne sont envoyés qu'au joueur concerné.
 | S → C | `QUICK_PLAY_MATCHED { roomId }` | Le client ouvre alors `/ws/room/{roomId}` |
 
 `room` = `{ roomId, fee, options, playerCount, maxPlayers, status, countdownEndsAt }`.
+
+**Précisions (SRV-10) :**
+
+* Un salon **public** figure dans la liste tant qu'il est `WAITING`, `COUNTDOWN` ou `STARTING` ; il en sort (`LOBBY_ROOM_REMOVED`) au lancement de la partie ou à sa fermeture. Les salons privés n'y figurent jamais. Chaque changement (arrivée, départ, compte à rebours, frais, options) produit un `LOBBY_ROOM_UPSERT`. `LOBBY_SNAPSHOT` liste les salons du plus rempli au moins rempli.
+* `QUICK_PLAY` : montant vérifié comme à la création (`INVALID_FEE`). Le serveur choisit un salon public `WAITING` ou `COUNTDOWN` non plein **au même montant, quelles que soient ses options**, le plus rempli d'abord (puis le compte à rebours le plus proche). Sinon, il crée un salon public **aux options par défaut**, dont le demandeur est l'hôte. Des parties rapides simultanées au même montant aboutissent au même salon créé. Réponse : `ACK`, puis `QUICK_PLAY_MATCHED`.
+* La liste peut avoir un léger retard : un `JOIN` dans le salon proposé peut recevoir `ROOM_FULL` ou `ROOM_LOCKED` ; l'app relance alors `QUICK_PLAY`.
 
 ### 6.5 Requêtes HTTP du Worker
 
@@ -242,13 +270,21 @@ Toutes exigent l'en-tête `Authorization: Bearer <jeton Supabase>`. Les opérati
 5. Côté serveur, la déconnexion déclenche les règles du cahier des charges §9 (délai de grâce de 60 s pendant son tour, puis actions automatiques, forfait après 3 tours manqués).
 6. **Un seul WebSocket par joueur et par salon** : une nouvelle connexion du même joueur ferme l'ancienne (code 4003).
 
+**Précisions (SRV-08) :**
+
+* Après `AUTH`, un joueur **assis** dans le salon reçoit directement `STATE` (sans `JOIN`). En partie, le moteur le note reconnecté ; les autres joueurs reçoivent `PLAYER_CONNECTION` (`connected: true`). À la fermeture de sa dernière connexion, ils reçoivent `PLAYER_CONNECTION` (`connected: false`), en salle d'attente comme en partie.
+* La règle « une seule connexion » (4003) s'applique aux connexions **salon**. Le remplacement d'une connexion par une autre du même joueur ne produit pas de `PLAYER_CONNECTION`.
+* **Identifiant déjà traité :** le serveur garde les 200 dernières réponses du salon. Un `id` renvoyé reçoit la **même** réponse (`ACK` ou `ERROR` avec le même code), sans que l'action soit rejouée. `JOIN` et `SYNC` en sont exclus : ils renvoient toujours l'état à jour.
+
+**Persistance du salon (SRV-07) :** l'état du salon (salle d'attente, partie, `seq`) est enregistré dans le stockage du RoomDO **avant** l'envoi de tout message qui en découle (`ACK`, événements, `STATE`). Un redémarrage du RoomDO ne perd donc aucun coup qu'un joueur a vu : le nouvel exemplaire relit l'état, l'alarme reste armée, et les joueurs qui se reconnectent reçoivent la partie sauvegardée avec `JOIN` (ou `SYNC`).
+
 ---
 
 ## 8. Limites
 
 | Limite | Valeur | Dépassement |
 | ----- | ----- | ----- |
-| Messages par connexion | 20 par seconde | `ERROR RATE_LIMITED` ; à la 3ᵉ fois, fermeture 4008 |
+| Messages par connexion | 20 par seconde | `ERROR RATE_LIMITED` (le message n'est pas traité) ; à la 3ᵉ seconde où la limite est dépassée, fermeture 4008 |
 | Taille d'un message | 4 Ko | Fermeture 4008 |
 | `CALL_CHECK` par joueur | 1 par fenêtre d'oubli | `ERROR NO_CHECK_TO_CALL` |
 | Créations de salon | 10 par heure et par joueur | `ERROR RATE_LIMITED` |
@@ -269,6 +305,13 @@ Un Durable Object n'a qu'**une alarme** : le RoomDO garde une liste d'échéance
 
 Le gestionnaire d'alarme est **idempotent** : il relit l'heure et l'état, et ne fait rien si l'échéance a déjà été traitée.
 
+**Précisions (SRV-06) :**
+
+* L'alarme traite, dans l'ordre chronologique, **toutes** les échéances dues (par exemple plusieurs joueurs déconnectés à la suite), dans la limite de 50 par déclenchement, puis se réarme sur la suivante. Une alarme en retard ne joue qu'une action automatique pour le joueur courant : le tour suivant part de l'heure de traitement.
+* La vie du salon en attente n'est une échéance que tant qu'il compte moins de 2 joueurs.
+* Partie trop longue : `GAME_OVER` avec `result: ABORTED`, `reason: TECHNICAL`, `winnerId: null`, commission et gain à 0, puis `refund_game` pour tous les joueurs débités.
+* Durées : clés `timers.*` de `game_config.ts` (règles §11.3).
+
 ---
 
 ## 10. Horloge
@@ -276,6 +319,7 @@ Le gestionnaire d'alarme est **idempotent** : il relit l'heure et l'état, et ne
 * Chaque `PONG` donne `s` (heure serveur). Le client calcule `rtt = maintenant − c` et `décalage = s + rtt/2 − maintenant`. Il garde la **médiane des 5 dernières mesures**.
 * Temps restant affiché = `turnDeadline − (maintenant + décalage)`.
 * La latence mesurée (`rtt`) est affichée discrètement (icône de signal : vert < 150 ms, orange < 400 ms, rouge au-delà).
+* L'app joint la dernière latence mesurée au `PING` suivant (champ `rtt`, facultatif) : le serveur l'écrit dans ses journaux (architecture §8), ce qui rend la latence réelle des joueurs visible côté serveur.
 
 ---
 
@@ -294,6 +338,7 @@ Le gestionnaire d'alarme est **idempotent** : il relit l'heure et l'état, et ne
 | `ROOM_FULL` / `ROOM_LOCKED` / `ROOM_NOT_FOUND` / `ROOM_STARTING` | « Salon complet. » / « Partie déjà commencée. » / « Salon introuvable. » / « La partie démarre… » |
 | `NOT_HOST` / `NOT_ENOUGH_PLAYERS` | « Seul l'hôte peut faire ça. » / « Il faut au moins 2 joueurs. » |
 | `INVALID_OPTIONS` | « Options de partie invalides. » |
+| `INVALID_MESSAGE` | « Une erreur est survenue. Rechargez l'application. » (message mal formé ; signe d'une app obsolète) |
 | `RATE_LIMITED` | « Trop d'actions, patientez un instant. » |
 
 Les codes liés aux comptes et aux jetons sont ceux de la spécification des jetons (§11.3).
@@ -322,6 +367,24 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.11 — 23/11/2026.** SRV-11 : champ `rtt` facultatif du `PING` (§6.1, §10).
+>
+> **Version 1.10 — 23/11/2026.** SRV-10 : liste des salons publics et partie rapide (§6.4).
+>
+> **Version 1.9 — 22/11/2026.** SRV-09 : salon actuel et réservation du joueur (§6.3).
+>
+> **Version 1.8 — 22/11/2026.** SRV-08 : reconnexion, connexion remplacée, identifiants déjà traités, limite de débit (§7, §8).
+>
+> **Version 1.7 — 20/11/2026.** SRV-07 : persistance du salon avant tout envoi (§7).
+>
+> **Version 1.6 — 20/11/2026.** SRV-06 : précisions sur le gestionnaire d'échéances (§9).
+>
+> **Version 1.5 — 20/11/2026.** SRV-04 : précisions sur la salle d'attente (§4.1).
+>
+> **Version 1.4 — 19/11/2026.** SRV-02 : `/ws/user/{userId}` ; format de `roomId` ; réponses 404 et 426 (§2).
+>
+> **Version 1.3 — 19/11/2026.** SRV-01 : `seq` réservé aux événements diffusés ; code `INVALID_MESSAGE` (§3, §11).
+>
 > **Version 1.2 — 19/11/2026.** `createGame` reçoit `now` et `gameId` (ENG-02). `applyPlay` reçoit `{ cards, suit?, declareCheck? }` ; ajout de `canPlayCard` (ENG-03). Dans `CARDS_PLAYED`, `nextPlayerId` et `turnDeadline` valent `null` quand le coup termine la partie. `applyDraw` reçoit `rng` (ENG-06) ; les événements privés du moteur (`YOU_DREW`) portent `playerId`, le destinataire, que le RoomDO retire avant l'envoi. `applyPlay` et `applyCheckCall` reçoivent `rng` (ENG-07). Toute pose ou pioche ferme la fenêtre de dénonciation ouverte et émet `CHECK_WINDOW` avec `targetId: null` avant ses propres événements. `applyTimeout` reçoit `rng`, `applyForfeit` reçoit `now`, `PLAYER_FORFEIT` porte `nextPlayerId` et `turnDeadline` (ENG-09). Ajout de `checkPlay` ; `getPlayerView` ne renvoie que la partie moteur de la vue (ENG-10).
 
 **Joueur déconnecté dont le tour arrive :** le moteur fixe `turnDeadline = now` (tour déjà échu). Le RoomDO programme alors son alarme immédiatement et appelle `applyTimeout` : c'est l'action automatique « immédiate » des règles §9.

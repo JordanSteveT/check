@@ -1,2 +1,7 @@
-// Protocol message types and Zod schemas. Filled in by ticket SRV-01.
-export const PROTOCOL_VERSION = 1;
+// Types and Zod schemas of the Check real-time protocol (protocole_temps_reel.md).
+
+export * from "./common.js";
+export * from "./client.js";
+export * from "./server.js";
+export * from "./http.js";
+export * from "./parse.js";

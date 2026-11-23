@@ -11,5 +11,9 @@
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@check/engine": "workspace:*",
+    "zod": "^4.6.7"
   }
 }

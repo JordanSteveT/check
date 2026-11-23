@@ -338,6 +338,8 @@ Toutes les constantes de jeu sont chargées depuis un fichier unique du Worker (
 | `timers.disconnect_grace_seconds` | 60 |
 | `timers.room_ttl_seconds` | 300 |
 | `timers.public_start_countdown_seconds` | 60 |
+| `timers.game_max_duration_seconds` | 7200 (partie annulée et remboursée au-delà, protocole §9) |
+| `timers.finished_room_close_seconds` | 60 (fermeture du salon après la fin de partie, protocole §9) |
 | `afk.max_consecutive_missed_turns` | 3 |
 | `penalty.seven` / `penalty.joker` | 2 / 4 |
 | `ace.combo_cumulative` | true |
