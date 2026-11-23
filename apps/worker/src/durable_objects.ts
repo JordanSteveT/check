@@ -267,11 +267,6 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
   }
 }
 
-/** One object per player: presence and current room. */
-export class UserDO extends ProtocolObject<"user"> {
-  protected readonly kind = "user";
-}
-
 /** Single object: list of public rooms and quick play. */
 export class LobbyDO extends ProtocolObject<"lobby"> {
   protected readonly kind = "lobby";

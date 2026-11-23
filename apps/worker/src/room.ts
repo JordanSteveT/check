@@ -32,7 +32,7 @@ import {
 import { dueDeadlines, roomDeadlines, type Deadline, type DeadlineTimers } from "./deadlines.js";
 import { ProtocolObject, type ActionMessage } from "./durable_objects.js";
 import { GAME_CONFIG, toEngineConfig } from "./game_config.js";
-import { LOCAL_ROOM_SERVICES, type RoomServices } from "./room_services.js";
+import { LOCAL_ROOM_SERVICES, type RoomRegistry, type RoomServices } from "./room_services.js";
 import { computeSettlement } from "./settlement.js";
 
 /** Parameters given by `POST /api/rooms` (already validated by the Worker). */
@@ -123,6 +123,8 @@ export class RoomDO extends ProtocolObject<"room"> {
   protected readonly kind = "room";
   /** External services (Supabase, UserDO). Public so that tests can replace them. */
   services: RoomServices = LOCAL_ROOM_SERVICES;
+  /** One room at a time per player (UserDO). Public so that tests can replace it. */
+  registry: RoomRegistry;
   /** Random generator of the game. Public so that tests can use a seeded one. */
   rng: Rng = cryptoRng;
   private state: RoomState | null = null;
@@ -131,9 +133,18 @@ export class RoomDO extends ProtocolObject<"room"> {
    * describes is durable, so a restart never loses a move that a player has seen (SRV-07).
    */
   private outbox: { ws: WebSocket; message: unknown }[] = [];
+  /** Players to free in their UserDO at the next commit. */
+  private releases = new Set<string>();
+  /** Players whose JOIN is in progress (claimed in their UserDO, not seated yet). */
+  private joining = new Set<string>();
 
   constructor(ctx: DurableObjectState, env: ConstructorParameters<typeof ProtocolObject>[1]) {
     super(ctx, env);
+    this.registry = {
+      claim: (userId, roomId) =>
+        env.USER.get(env.USER.idFromName(userId)).claimRoom(userId, roomId),
+      release: (userId, roomId) => env.USER.get(env.USER.idFromName(userId)).releaseRoom(roomId),
+    };
     void ctx.blockConcurrencyWhile(async () => {
       this.state = (await ctx.storage.get<RoomState>(STORAGE_KEY)) ?? null;
     });
@@ -167,6 +178,16 @@ export class RoomDO extends ProtocolObject<"room"> {
     };
     await this.commit();
     await this.reschedule();
+  }
+
+  /** Whether the player still holds a seat here (asked by the UserDO before refusing a room). */
+  isSeated(userId: string): boolean {
+    // A JOIN in progress holds the seat too: two simultaneous JOINs cannot both succeed.
+    if (this.joining.has(userId)) return true;
+    const room = this.state;
+    if (room === null || !room.players.some((p) => p.id === userId)) return false;
+    if (room.status === "PLAYING") return !(room.game?.forfeited.includes(userId) ?? false);
+    return room.status === "WAITING" || room.status === "COUNTDOWN" || room.status === "STARTING";
   }
 
   /** Copy of the state (debugging and tests). */
@@ -342,18 +363,34 @@ export class RoomDO extends ProtocolObject<"room"> {
       return;
     }
 
+    const roomId = this.ctx.id.toString();
+    this.joining.add(userId);
+    try {
+      await this.joinClaimed(ws, userId, id, roomId);
+    } finally {
+      this.joining.delete(userId);
+    }
+  }
+
+  private async joinClaimed(
+    ws: WebSocket,
+    userId: string,
+    id: string,
+    roomId: string,
+  ): Promise<void> {
+    if (!(await this.registry.claim(userId, roomId))) {
+      this.error(ws, id, "ALREADY_IN_ROOM");
+      return;
+    }
     const check = await this.services.checkCanJoin(userId, {
       type: this.room().type,
       fee: this.room().fee,
     });
-    // The state may have changed during the call.
+    // The state may have changed during the calls.
     const refusedNow = this.isPlayer(userId) ? null : this.joinRefusal();
-    if (refusedNow !== null) {
-      this.error(ws, id, refusedNow);
-      return;
-    }
-    if (!check.ok) {
-      this.error(ws, id, check.code);
+    if (refusedNow !== null || !check.ok) {
+      if (!this.isPlayer(userId)) this.releases.add(userId);
+      this.error(ws, id, refusedNow ?? (check.ok ? "ROOM_LOCKED" : check.code));
       return;
     }
 
@@ -613,6 +650,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     room.game = result.state;
     let over: GameOverEvent | null = null;
     for (const event of result.events) {
+      if (event.t === "PLAYER_FORFEIT") this.releases.add(event.playerId);
       if (event.t === "YOU_DREW") {
         for (const socket of this.sockets(event.playerId)) {
           this.queue(socket, { t: "YOU_DREW", cards: event.cards });
@@ -651,6 +689,7 @@ export class RoomDO extends ProtocolObject<"room"> {
     const settlement = computeSettlement(room.pot, this.services.commissionPercent, event.result);
     room.status = "FINISHED";
     room.finishedAt = this.clock();
+    for (const player of room.players) this.releases.add(player.id);
     this.broadcast({ ...event, ...settlement });
     await this.commit();
     const gameId = room.gameId ?? "";
@@ -674,6 +713,7 @@ export class RoomDO extends ProtocolObject<"room"> {
   /** §2.1.4 — the room is destroyed: every connection is closed with 4004. */
   private async closeRoom(): Promise<void> {
     this.room().status = "CLOSED";
+    for (const player of this.room().players) this.releases.add(player.id);
     await this.commit();
     for (const ws of this.ctx.getWebSockets()) ws.close(CLOSE_CODES.ROOM_CLOSED, "ROOM_CLOSED");
   }
@@ -682,6 +722,7 @@ export class RoomDO extends ProtocolObject<"room"> {
   private removePlayer(userId: string, reason: "LEFT" | "KICKED_BALANCE"): void {
     const room = this.room();
     room.players = room.players.filter((p) => p.id !== userId);
+    this.releases.add(userId);
     this.broadcast({ t: "PLAYER_LEFT", playerId: userId, reason });
     // §2.1.5 — the host role passes to the player who arrived first.
     const first = room.players[0];
@@ -799,5 +840,18 @@ export class RoomDO extends ProtocolObject<"room"> {
   private async commit(): Promise<void> {
     if (this.state !== null) await this.ctx.storage.put(STORAGE_KEY, this.state);
     for (const { ws, message } of this.outbox.splice(0)) this.send(ws, message);
+    const roomId = this.ctx.id.toString();
+    for (const userId of [...this.releases]) {
+      this.releases.delete(userId);
+      try {
+        await this.registry.release(userId, roomId);
+      } catch (err) {
+        // The UserDO checks with the room before refusing a claim, so a missed release
+        // cannot lock the player out.
+        console.error(
+          JSON.stringify({ msg: "release failed", roomId, userId, error: String(err) }),
+        );
+      }
+    }
   }
 }

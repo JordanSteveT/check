@@ -223,6 +223,13 @@ Les événements marqués « privé » ne sont envoyés qu'au joueur concerné.
 | S → C | `CURRENT_ROOM` `{ roomId \| null }` | À la connexion : permet de revenir dans une partie en cours après un rechargement |
 | S → C | `GUEST_EXPIRING` `{ secondsLeft }` | Invité reconnecté pendant le délai de 5 min |
 
+**Précisions (SRV-09) :**
+
+* `CURRENT_ROOM` est envoyé à la connexion **et à chaque changement** du salon du joueur (entrée, sortie, fin de partie).
+* Un joueur est réservé par un salon dès son `JOIN` (avant `check_can_join`) et libéré quand il quitte la salle d'attente, est retiré au lancement (`KICKED_BALANCE`), **abandonne ou est déclaré forfait**, à la fin de la partie ou à la fermeture du salon. Une entrée dans un autre salon pendant ce temps reçoit `ALREADY_IN_ROOM`.
+* Avant de refuser, le UserDO demande à l'ancien salon si le joueur y est encore assis : une réservation périmée (salon fermé, libération manquée) ne bloque jamais le joueur.
+* Plusieurs connexions `/ws/user` du même joueur (plusieurs onglets) sont acceptées : la règle 4003 ne concerne que les connexions salon.
+
 ### 6.4 Connexion liste (`/ws/lobby`)
 
 | Sens | Message | Rôle |
@@ -353,6 +360,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.9 — 22/11/2026.** SRV-09 : salon actuel et réservation du joueur (§6.3).
+>
 > **Version 1.8 — 22/11/2026.** SRV-08 : reconnexion, connexion remplacée, identifiants déjà traités, limite de débit (§7, §8).
 >
 > **Version 1.7 — 20/11/2026.** SRV-07 : persistance du salon avant tout envoi (§7).

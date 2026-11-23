@@ -49,6 +49,13 @@ async function player(roomId: string, userId = crypto.randomUUID()): Promise<Pla
 
 const is = (t: string) => (m: Message) => m["t"] === t;
 
+/** Waits (up to 2 s) until `condition` holds: the settlement runs just after GAME_OVER is sent. */
+async function eventually(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 40 && !condition(); i++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
 async function withRoom(roomId: string, apply: (instance: RoomDO) => void): Promise<void> {
   await runInDurableObject(stub(roomId), apply);
 }
@@ -224,6 +231,7 @@ describe("SRV-05 — coups joués", () => {
     });
     const winner = over?.["winnerId"] as string;
     expect([a.id, b.id]).toContain(winner);
+    await eventually(() => settled.length > 0);
     expect(settled).toEqual([[expect.any(String), winner, 360, 40]]);
     expect((await state(roomId)).status).toBe("FINISHED");
 
@@ -265,6 +273,7 @@ describe("SRV-05 — abandon, temps écoulé et fin", () => {
       pot: 400,
       payout: 360,
     });
+    await eventually(() => settled.length > 0);
     expect(settled).toEqual([[expect.any(String), b.id, 360, 40]]);
     expect((await state(roomId)).status).toBe("FINISHED");
     a.client.close();

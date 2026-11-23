@@ -30,6 +30,14 @@ export interface RoomServices {
   refundGame(gameId: string, playerIds: string[], fee: number): Promise<void>;
 }
 
+/** One room at a time per player (spécification des jetons P8), kept by the UserDOs. */
+export interface RoomRegistry {
+  /** Reserves the player for the room; false if already seated in another room. */
+  claim(userId: string, roomId: string): Promise<boolean>;
+  /** Frees the player (if still reserved by this room). */
+  release(userId: string, roomId: string): Promise<void>;
+}
+
 /** Default values of `app_config` (spécification des jetons §12). */
 export const DEFAULT_FEE_RULE: FeeRule = { min: 200, max: 10_000, step: 100 };
 
