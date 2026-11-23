@@ -2,7 +2,7 @@
 // arrives with the account and token tickets (ECO-03, ECO-04) and SRV-09; until then the
 // local implementation accepts everyone, which is enough for local play and the tests.
 
-import type { RoomType } from "@check/protocol";
+import type { LobbyRoom, RoomType } from "@check/protocol";
 
 export type FeeRule = { min: number; max: number; step: number };
 
@@ -36,6 +36,12 @@ export interface RoomRegistry {
   claim(userId: string, roomId: string): Promise<boolean>;
   /** Frees the player (if still reserved by this room). */
   release(userId: string, roomId: string): Promise<void>;
+}
+
+/** List of public rooms (LobbyDO). */
+export interface LobbyPublisher {
+  upsert(room: LobbyRoom): Promise<void>;
+  remove(roomId: string): Promise<void>;
 }
 
 /** Default values of `app_config` (spécification des jetons §12). */

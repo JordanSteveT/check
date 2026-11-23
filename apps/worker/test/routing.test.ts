@@ -1,10 +1,11 @@
 import { SELF, env } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { upgradeRequest } from "./helpers.js";
 
 const BASE = "https://check.test";
 
 function upgrade(path: string): Promise<Response> {
-  return SELF.fetch(`${BASE}${path}`, { headers: { Upgrade: "websocket" } });
+  return upgradeRequest(path);
 }
 
 /** Opens then closes the WebSocket returned by a 101 response. */

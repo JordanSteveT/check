@@ -1,6 +1,6 @@
 // Bindings of the Worker (wrangler.jsonc) and server configuration read from them.
 
-import type { LobbyDO } from "./durable_objects.js";
+import type { LobbyDO } from "./lobby.js";
 import type { UserDO } from "./user.js";
 import type { RoomDO } from "./room.js";
 

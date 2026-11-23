@@ -63,8 +63,23 @@ export type Client = {
 };
 
 /** Opens a WebSocket on `path` through the Worker. */
+/**
+ * WebSocket upgrade through the Worker. Objects shared by several test files (the single
+ * LobbyDO) may be invalidated when the next file reloads the module: workerd then asks to
+ * retry the call, which we do.
+ */
+export async function upgradeRequest(path: string): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await SELF.fetch(`${BASE}${path}`, { headers: { Upgrade: "websocket" } });
+    } catch (err) {
+      if (attempt >= 3 || !String(err).includes("retry")) throw err;
+    }
+  }
+}
+
 export async function connect(path: string): Promise<Client> {
-  const response = await SELF.fetch(`${BASE}${path}`, { headers: { Upgrade: "websocket" } });
+  const response = await upgradeRequest(path);
   const ws = response.webSocket;
   if (ws === null) throw new Error(`no WebSocket for ${path} (HTTP ${response.status})`);
   ws.accept();

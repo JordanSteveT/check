@@ -241,6 +241,12 @@ Les événements marqués « privé » ne sont envoyés qu'au joueur concerné.
 
 `room` = `{ roomId, fee, options, playerCount, maxPlayers, status, countdownEndsAt }`.
 
+**Précisions (SRV-10) :**
+
+* Un salon **public** figure dans la liste tant qu'il est `WAITING`, `COUNTDOWN` ou `STARTING` ; il en sort (`LOBBY_ROOM_REMOVED`) au lancement de la partie ou à sa fermeture. Les salons privés n'y figurent jamais. Chaque changement (arrivée, départ, compte à rebours, frais, options) produit un `LOBBY_ROOM_UPSERT`. `LOBBY_SNAPSHOT` liste les salons du plus rempli au moins rempli.
+* `QUICK_PLAY` : montant vérifié comme à la création (`INVALID_FEE`). Le serveur choisit un salon public `WAITING` ou `COUNTDOWN` non plein **au même montant, quelles que soient ses options**, le plus rempli d'abord (puis le compte à rebours le plus proche). Sinon, il crée un salon public **aux options par défaut**, dont le demandeur est l'hôte. Des parties rapides simultanées au même montant aboutissent au même salon créé. Réponse : `ACK`, puis `QUICK_PLAY_MATCHED`.
+* La liste peut avoir un léger retard : un `JOIN` dans le salon proposé peut recevoir `ROOM_FULL` ou `ROOM_LOCKED` ; l'app relance alors `QUICK_PLAY`.
+
 ### 6.5 Requêtes HTTP du Worker
 
 | Route | Corps | Réponse | Erreurs |
@@ -360,6 +366,8 @@ Fonctions pures, sans effet de bord, utilisées par le RoomDO **et** par l'app (
 
 `config` (type `EngineConfig`) est construit par le Worker à partir de `game_config.ts` ; le moteur n'a pas de valeurs par défaut. L'état du moteur ne contient que du JSON (pas de `Set` ni de `Map`) pour être sauvegardé tel quel par le RoomDO ; la pioche a son dessus en `deck[0]`.
 
+> **Version 1.10 — 23/11/2026.** SRV-10 : liste des salons publics et partie rapide (§6.4).
+>
 > **Version 1.9 — 22/11/2026.** SRV-09 : salon actuel et réservation du joueur (§6.3).
 >
 > **Version 1.8 — 22/11/2026.** SRV-08 : reconnexion, connexion remplacée, identifiants déjà traités, limite de débit (§7, §8).

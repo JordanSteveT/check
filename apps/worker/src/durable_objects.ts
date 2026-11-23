@@ -266,8 +266,3 @@ export abstract class ProtocolObject<K extends ConnectionKind> extends DurableOb
     await this.onAuthenticated(ws, result.userId, att.phase === "pending");
   }
 }
-
-/** Single object: list of public rooms and quick play. */
-export class LobbyDO extends ProtocolObject<"lobby"> {
-  protected readonly kind = "lobby";
-}

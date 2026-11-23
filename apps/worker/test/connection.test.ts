@@ -116,6 +116,7 @@ describe("SRV-03 — AUTH sur les connexions joueur et liste", () => {
 
   it("/ws/lobby : AUTH puis PING", async () => {
     const client = await authenticated("/ws/lobby");
+    expect(await client.next()).toMatchObject({ t: "LOBBY_SNAPSHOT" });
     client.send({ t: "PING", c: 5 });
     expect(await client.next()).toMatchObject({ t: "PONG", c: 5 });
     client.close();

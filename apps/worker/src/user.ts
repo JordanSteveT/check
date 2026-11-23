@@ -4,6 +4,7 @@
 
 import { ProtocolObject } from "./durable_objects.js";
 import type { Env } from "./env.js";
+import { withRetry } from "./retry.js";
 
 type UserState = {
   /** Room the player is seated in (waiting room or game), or null. */
@@ -71,7 +72,9 @@ export class UserDO extends ProtocolObject<"user"> {
 
   private async stillSeated(userId: string, roomId: string): Promise<boolean> {
     try {
-      return await this.env.ROOM.get(this.env.ROOM.idFromString(roomId)).isSeated(userId);
+      return await withRetry(() =>
+        this.env.ROOM.get(this.env.ROOM.idFromString(roomId)).isSeated(userId),
+      );
     } catch {
       // Unknown room id, or the room cannot answer: the reservation is kept (safer).
       return true;

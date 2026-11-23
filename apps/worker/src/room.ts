@@ -32,7 +32,14 @@ import {
 import { dueDeadlines, roomDeadlines, type Deadline, type DeadlineTimers } from "./deadlines.js";
 import { ProtocolObject, type ActionMessage } from "./durable_objects.js";
 import { GAME_CONFIG, toEngineConfig } from "./game_config.js";
-import { LOCAL_ROOM_SERVICES, type RoomRegistry, type RoomServices } from "./room_services.js";
+import { LOBBY_NAME } from "./lobby.js";
+import { withRetry } from "./retry.js";
+import {
+  LOCAL_ROOM_SERVICES,
+  type LobbyPublisher,
+  type RoomRegistry,
+  type RoomServices,
+} from "./room_services.js";
 import { computeSettlement } from "./settlement.js";
 
 /** Parameters given by `POST /api/rooms` (already validated by the Worker). */
@@ -125,6 +132,10 @@ export class RoomDO extends ProtocolObject<"room"> {
   services: RoomServices = LOCAL_ROOM_SERVICES;
   /** One room at a time per player (UserDO). Public so that tests can replace it. */
   registry: RoomRegistry;
+  /** List of public rooms (LobbyDO). Public so that tests can replace it. */
+  lobby: LobbyPublisher;
+  /** Last entry published to the lobby (JSON), to publish only changes. */
+  private lobbyPublished: string | null = null;
   /** Random generator of the game. Public so that tests can use a seeded one. */
   rng: Rng = cryptoRng;
   private state: RoomState | null = null;
@@ -140,10 +151,16 @@ export class RoomDO extends ProtocolObject<"room"> {
 
   constructor(ctx: DurableObjectState, env: ConstructorParameters<typeof ProtocolObject>[1]) {
     super(ctx, env);
+    // Calls to other objects: a fresh stub per attempt, retried on transient failures.
+    const userStub = (userId: string) => env.USER.get(env.USER.idFromName(userId));
     this.registry = {
-      claim: (userId, roomId) =>
-        env.USER.get(env.USER.idFromName(userId)).claimRoom(userId, roomId),
-      release: (userId, roomId) => env.USER.get(env.USER.idFromName(userId)).releaseRoom(roomId),
+      claim: (userId, roomId) => withRetry(() => userStub(userId).claimRoom(userId, roomId)),
+      release: (userId, roomId) => withRetry(() => userStub(userId).releaseRoom(roomId)),
+    };
+    const lobbyStub = () => env.LOBBY.get(env.LOBBY.idFromName(LOBBY_NAME));
+    this.lobby = {
+      upsert: (room) => withRetry(() => lobbyStub().upsertRoom(room)),
+      remove: (roomId) => withRetry(() => lobbyStub().removeRoom(roomId)),
     };
     void ctx.blockConcurrencyWhile(async () => {
       this.state = (await ctx.storage.get<RoomState>(STORAGE_KEY)) ?? null;
@@ -852,6 +869,39 @@ export class RoomDO extends ProtocolObject<"room"> {
           JSON.stringify({ msg: "release failed", roomId, userId, error: String(err) }),
         );
       }
+    }
+    await this.syncLobby();
+  }
+
+  /**
+   * A public room is listed in the lobby while it can be joined or is starting (WAITING,
+   * COUNTDOWN, STARTING), then removed; only changes are published (protocole §6.4).
+   */
+  private async syncLobby(): Promise<void> {
+    const room = this.state;
+    if (room?.type !== "PUBLIC") return;
+    const roomId = this.ctx.id.toString();
+    const listed =
+      room.status === "WAITING" || room.status === "COUNTDOWN" || room.status === "STARTING";
+    const entry = listed
+      ? {
+          roomId,
+          fee: room.fee,
+          options: room.options,
+          playerCount: room.players.length,
+          maxPlayers: GAME_CONFIG.players.max,
+          status: room.status,
+          countdownEndsAt: room.countdownEndsAt,
+        }
+      : null;
+    const key = JSON.stringify(entry);
+    if (key === this.lobbyPublished) return;
+    try {
+      if (entry === null) await this.lobby.remove(roomId);
+      else await this.lobby.upsert(entry);
+      this.lobbyPublished = key;
+    } catch (err) {
+      console.error(JSON.stringify({ msg: "lobby update failed", roomId, error: String(err) }));
     }
   }
 }
